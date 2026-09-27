@@ -74,6 +74,123 @@ ln -s ../../runtime/bin/node "$APP/node_modules/.bin/node"
 cp -a "$ROOT/node_modules/node-pty" "$ROOT/node_modules/node-addon-api" "$APP/node_modules/"
 cp -a "$ROOT/node_modules/@xterm/headless" "$APP/node_modules/@xterm/"
 rm -rf "$APP/node_modules/node-pty/build" "$APP/node_modules/node-pty/prebuilds"
+
+# Ship the application's own dependency closure (smol-toml, @oh-my-pi/pi-natives,
+# ...) next to the flattened Pi packages above. The launcher runs this tree with
+# --no-global-search-paths and NODE_PATH="$APP/node_modules", so a package the app
+# imports but this step does not copy only shows up as ERR_MODULE_NOT_FOUND when
+# a user starts the TUI.
+"$NODE_HOME/bin/node" - "$ROOT" "$APP" <<'JS'
+const { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync } = require("node:fs");
+const { dirname, isAbsolute, join, relative } = require("node:path");
+
+// Each package is looked up twice: inside the bundle, starting from the
+// directory its importer really lives in, and inside the source checkout, which
+// is where anything the bundle does not have yet must come from.
+const [source, app] = process.argv.slice(2);
+const modules = join(app, "node_modules");
+const queue = [];
+const state = new Map();
+const unresolved = new Set();
+
+function within(path, root) {
+	const rel = relative(root, path);
+	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+/** Node's upward lookup for a bare specifier, confined to one tree. */
+function resolvePackage(from, name, root) {
+	let dir = from;
+	try { dir = realpathSync(from); } catch { /* keep the unresolved path */ }
+	while (within(dir, root)) {
+		const candidate = join(dir, "node_modules", ...name.split("/"));
+		if (existsSync(join(candidate, "package.json"))) return candidate;
+		if (dir === root) break;
+		const parent = dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	return undefined;
+}
+
+function request(name, stagedFrom, sourceFrom, required) {
+	const entry = state.get(name);
+	if (!entry) {
+		const queued = { name, stagedFrom, sourceFrom, required };
+		state.set(name, queued);
+		queue.push(queued);
+		return;
+	}
+	if (required) entry.required = true;
+	if (entry.done && entry.missing) unresolved.add(name);
+}
+
+const IMPORT = /(?:\bimport\s*\(\s*|\brequire\s*\(\s*|\b(?:import|export)\s+(?:[\w$*{},\s]*?\s+from\s*)?)["']([^"']+)["']/g;
+function* sources(directory) {
+	for (const entry of readdirSync(join(source, directory), { withFileTypes: true })) {
+		const path = join(directory, entry.name);
+		if (entry.isDirectory()) yield* sources(path);
+		else if (entry.isFile() && /\.(?:[cm]?js|ts)$/.test(entry.name)) yield path;
+	}
+}
+const PACKAGE_NAME = /^(?:@[A-Za-z0-9][\w.-]*\/)?[A-Za-z0-9][\w.-]*$/;
+function packageName(specifier) {
+	if (specifier.startsWith("node:") || specifier.startsWith(".") || specifier.startsWith("/")) return undefined;
+	const parts = specifier.split("/");
+	const name = specifier.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
+	// Rejects captures that came from a string literal rather than an import.
+	return PACKAGE_NAME.test(name) ? name : undefined;
+}
+
+const manifest = JSON.parse(readFileSync(join(source, "package.json"), "utf8"));
+for (const name of Object.keys(manifest.dependencies || {})) request(name, app, source, true);
+for (const name of Object.keys(manifest.optionalDependencies || {})) request(name, app, source, false);
+// Bare imports that nothing declares resolve today only because some other
+// package happens to hoist them, so the bundle has to ship them explicitly.
+for (const directory of ["app", "bin", "src"]) {
+	for (const path of sources(directory)) {
+		const text = readFileSync(join(source, path), "utf8");
+		const stagedFrom = join(app, dirname(path));
+		const sourceFrom = join(source, dirname(path));
+		for (const match of text.matchAll(IMPORT)) {
+			const name = packageName(match[1]);
+			if (name) request(name, stagedFrom, sourceFrom, true);
+		}
+	}
+}
+
+while (queue.length) {
+	const entry = queue.shift();
+	const staged = resolvePackage(entry.stagedFrom, entry.name, app);
+	const sourceDir = resolvePackage(entry.sourceFrom, entry.name, source);
+	if (!staged && !sourceDir) {
+		entry.done = true;
+		entry.missing = true;
+		if (entry.required) unresolved.add(entry.name);
+		continue;
+	}
+	let stagedChildren = staged;
+	if (!staged) {
+		stagedChildren = join(modules, ...entry.name.split("/"));
+		mkdirSync(dirname(stagedChildren), { recursive: true });
+		cpSync(sourceDir, stagedChildren, { recursive: true, dereference: true });
+	}
+	entry.done = true;
+	// Optional leaves are platform binaries: skip them when the build host does
+	// not ship them instead of failing the build.
+	const installed = JSON.parse(readFileSync(join(staged || sourceDir, "package.json"), "utf8"));
+	const sourceFrom = sourceDir || source;
+	for (const name of Object.keys(installed.dependencies || {})) request(name, stagedChildren, sourceFrom, entry.required);
+	for (const name of Object.keys(installed.optionalDependencies || {})) request(name, stagedChildren, sourceFrom, false);
+}
+
+if (unresolved.size) {
+	console.error("Bundled runtime is missing dependencies required by the application:");
+	for (const name of [...unresolved].sort()) console.error(`  ${name}`);
+	process.exit(1);
+}
+JS
+
 if [[ "$DIRECT_BUILD" == 1 ]]; then
 	NATIVE_BINARY="${TSUKUYOMI_NATIVE_BINARY:-}"
 	[[ -f "$NATIVE_BINARY" ]] || { echo 'TSUKUYOMI_NATIVE_BINARY must point to a rebuilt node-pty pty.node in direct mode.' >&2; exit 1; }
@@ -95,7 +212,7 @@ install -m644 "$ROOT/README.md" "$WORK/stage/usr/share/doc/tsukuyomi/README.md"
 install -m644 "$ROOT/LICENSE" "$WORK/stage/usr/share/doc/tsukuyomi/copyright"
 
 python3 - "$APP" <<'PY'
-import pathlib, sys
+import json, pathlib, sys
 root = pathlib.Path(sys.argv[1]).resolve()
 required = [
     root / 'node_modules/@earendil-works/pi-tui/dist/index.js',
@@ -105,6 +222,10 @@ required = [
     root / 'app/providers/accounts.mjs',
 ]
 missing = [str(path) for path in required if not path.exists()]
+manifest = json.loads((root / 'package.json').read_text())
+declared = sorted(set(manifest.get('dependencies', {})) | set(manifest.get('optionalDependencies', {})))
+missing += [str(root / 'node_modules' / name / 'package.json') for name in declared
+            if not (root / 'node_modules' / name / 'package.json').exists()]
 if missing:
     raise SystemExit('Bundled runtime is incomplete:\n' + '\n'.join(missing))
 for p in root.rglob('*'):
