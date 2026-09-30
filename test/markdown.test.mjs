@@ -237,6 +237,15 @@ test("renderMarkdownWithCode reports a code block's rows and horizontal bounds",
 	assert.ok(stripAnsi(rows[block.rowStart + 1]).includes("…"), "unscrolled rows truncate as before");
 });
 
+test("TUI code wrapping keeps long source lines inside the frame", () => {
+	const long = "const value = aVeryLongFunctionName(argumentOne, argumentTwo);";
+	const rendered = renderMarkdownWithCode("```js\n" + long + "\n```", { width: 40, wrapCode: true });
+	const block = rendered.codeBlocks[0];
+	assert.equal(block.maxScroll, 0);
+	assert.ok(rendered.rows.slice(block.rowStart, block.rowEnd).length > 4, "the long line wraps to multiple rows");
+	for (const row of rendered.rows.slice(block.rowStart, block.rowEnd)) assert.equal(visibleLength(stripAnsi(row)), 40);
+});
+
 test("a code block scrolls sideways without moving its border", () => {
 	const long = "const value = aVeryLongFunctionName(argumentOne, argumentTwo);";
 	const md = `\`\`\`js\n${long}\n\`\`\``;

@@ -748,14 +748,14 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 	const markdownCached = (owner, field, value, width, codePrefix) => {
 		const scrollKey = codeScrollKey(codePrefix);
 		if (!owner || typeof value !== "string") {
-			const fresh = renderMarkdownWithCode(value, { width, codePrefix, scrolls: state.codeScroll });
+			const fresh = renderMarkdownWithCode(value, { width, codePrefix, scrolls: state.codeScroll, wrapCode: true });
 			return { rows: fresh.rows, codeBlocks: fresh.codeBlocks, scrollKey };
 		}
 		let slots = markdownMemo.get(owner);
 		if (!slots) { slots = new Map(); markdownMemo.set(owner, slots); }
 		const cached = slots.get(field);
 		if (cached && cached.width === width && cached.value === value && cached.scrollKey === scrollKey) return cached;
-		const fresh = renderMarkdownWithCode(value, { width, codePrefix, scrolls: state.codeScroll });
+		const fresh = renderMarkdownWithCode(value, { width, codePrefix, scrolls: state.codeScroll, wrapCode: true });
 		const entry = { width, value, scrollKey, rows: fresh.rows, codeBlocks: fresh.codeBlocks };
 		slots.set(field, entry);
 		return entry;
@@ -795,15 +795,16 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 	const renderToolRows = (tool, name, width) => {
 		const source = tool.rows(locale, tui.terminal.rows);
 		const header = source.find((row) => row.kind === "header");
+		const command = tool?.name === "bash" && tool?.args?.command ? String(tool.args.command) : "";
 		const footer = source.findLast((row) => row.kind === "footer");
 		const body = source.filter((row) => row !== header && row !== footer).map((row) => {
 			const content = toolRowContent(row, tool, name);
 			return toolRowPaint(row)(content || " ");
 		});
-		const sections = [{ lines: body }];
+		const sections = [{ lines: command ? [`$ ${command}`, ...body] : body }];
 		if (footer) sections.push({ lines: [toolRowPaint(footer)(toolRowContent(footer, tool, name))] });
 		return renderOutputBlock({
-			header: header ? toolRowContent(header, tool, name) : name || "tool",
+			header: header ? toolRowContent({ ...header, text: header.text.replace(command, "").replace(/\s+·\s+\d+s$/, "") }, tool, name) : name || "tool",
 			state: tool.status,
 			sections,
 			width: Math.max(8, width - 2),
@@ -3515,7 +3516,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 						const key = `${phaseWidth}\0${phase.text || ""}\0${codeScrollKey(phaseCodePrefix)}`;
 						if (phase.markdownKey !== key) {
 							phase.markdownKey = key;
-							const rendered = renderMarkdownWithCode(phase.text || "", { width: phaseWidth, codePrefix: phaseCodePrefix, scrolls: state.codeScroll });
+							const rendered = renderMarkdownWithCode(phase.text || "", { width: phaseWidth, codePrefix: phaseCodePrefix, scrolls: state.codeScroll, wrapCode: true });
 							phase.markdownRows = rendered.rows;
 							phase.markdownBlocks = rendered.codeBlocks;
 						}
@@ -3661,9 +3662,10 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 				const visible = output.slice(-20).map((line) => color.muted(line || " "));
 				if (output.length > visible.length) visible.unshift(color.dim(`… ${output.length - visible.length} earlier lines`));
 				lines.push(...renderOutputBlock({
-					header: `$ ${message.command || ""}`,
+					header: "bash",
+					meta: "command",
+					sections: [{ lines: [`$ ${message.command || ""}`, ...visible] }],
 					state: Number(message.exitCode) ? "error" : "done",
-					sections: [{ lines: visible }],
 					width: Math.max(8, inner - 2),
 				}).map((line) => `  ${line}`));
 				lines.push("");

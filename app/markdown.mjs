@@ -624,7 +624,7 @@ function trimBareUrl(url) {
 // Block parsing
 // ─────────────────────────────────────────────────────────────────────────────
 
-export function renderMarkdown(input, { width = 80, depth = 0, scrolls, collect, codeSeq, codePrefix = "md" } = {}) {
+export function renderMarkdown(input, { width = 80, depth = 0, scrolls, collect, codeSeq, codePrefix = "md", wrapCode = false } = {}) {
 	if (!input) return [];
 	// Nested list content is re-rendered recursively; a pathological input of
 	// nothing but markers would otherwise recurse without bound.
@@ -669,7 +669,7 @@ export function renderMarkdown(input, { width = 80, depth = 0, scrolls, collect,
 			}
 			i++; // skip closing fence
 			const id = `${codePrefix}:${seq.n++}`;
-			const block = renderCodeBlock(body, lang, width, scrolls?.get(id) ?? 0);
+			const block = renderCodeBlock(body, lang, width, scrolls?.get(id) ?? 0, wrapCode);
 			pushBlock(block.rows);
 			// The rows themselves already live in the returned array; keep the
 			// metadata lean so it can be cached per message without duplication.
@@ -756,7 +756,7 @@ export function renderMarkdown(input, { width = 80, depth = 0, scrolls, collect,
 			// Trailing blank-adjacent runs of only whitespace are not code;
 			// the loop above already stops at blank lines.
 			const id = `${codePrefix}:${seq.n++}`;
-			const block = renderCodeBlock(body, "", width, scrolls?.get(id) ?? 0);
+			const block = renderCodeBlock(body, "", width, scrolls?.get(id) ?? 0, wrapCode);
 			pushBlock(block.rows);
 			const { rows: blockRows, ...meta } = block;
 			collect?.push({ id, rowStart: rows.length - blockRows.length, rowEnd: rows.length, ...meta });
@@ -1082,15 +1082,15 @@ function renderSeparator(widths, left, mid, right) {
 // Code blocks + syntax highlighting
 // ─────────────────────────────────────────────────────────────────────────────
 
-function renderCodeBlock(lines, lang, width, scrollX = 0) {
+function renderCodeBlock(lines, lang, width, scrollX = 0, wrapCode = false) {
 	// Idempotent: renderMarkdown already expanded, this guards direct callers.
 	const highlighted = highlight(lines.map((line) => expandTabs(line, CODE_TAB_WIDTH)).join("\n"), lang).split("\n");
 	return renderOutputBlockDetailed({
 		header: lang || "Code",
 		sections: [{ lines: highlighted }],
-		noWrap: true,
+		noWrap: !wrapCode,
 		width,
-		scrollX,
+		scrollX: wrapCode ? 0 : scrollX,
 	});
 }
 
@@ -1163,7 +1163,7 @@ export function renderOutputBlockDetailed({ header = "", meta = "", state, secti
 	const rawLines = normalized.flatMap((section) => (section.lines || []).map((line) => String(line).trimEnd()));
 	// The widest raw line bounds how far the viewport can scroll.
 	const contentWidth = rawLines.reduce((max, line) => Math.max(max, visibleLength(line)), 0);
-	const maxScroll = Math.max(0, contentWidth - innerWidth);
+	const maxScroll = noWrap ? Math.max(0, contentWidth - innerWidth) : 0;
 	const offset = Math.max(0, Math.min(maxScroll, Math.floor(scrollX) || 0));
 	const fit = (value) => {
 		const windowed = offset > 0 ? sliceAnsiColumns(value, offset, offset + innerWidth) : value;
@@ -1189,7 +1189,12 @@ export function renderOutputBlockDetailed({ header = "", meta = "", state, secti
 		}
 		for (const source of section.lines || []) {
 			const raw = String(source).trimEnd();
-			const wrapped = noWrap ? [raw] : wrapAnsi(raw, innerWidth);
+			const wrapped = noWrap ? [raw] : wrapAnsi(raw, innerWidth).flatMap((line) => {
+				if (visibleLength(line) <= innerWidth) return [line];
+				const chunks = [];
+				for (let start = 0; start < visibleLength(line); start += innerWidth) chunks.push(sliceAnsiColumns(line, start, start + innerWidth));
+				return chunks;
+			});
 			for (const line of wrapped.length ? wrapped : [""]) {
 				rows.push(paintRow(`${border}│${RESET} ${fit(line)} ${border}│${RESET}`));
 			}
