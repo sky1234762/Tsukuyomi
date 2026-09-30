@@ -16,3 +16,4 @@ sudo apt install ./dist/packages/tsukuyomi_0.6.2-1_amd64.deb
 ## Arch/CachyOS（本机）
 sudo pacman -U ./dist/packages/tsukuyomi-0.6.2-1-x86_64.pkg.tar.zst
 
+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
