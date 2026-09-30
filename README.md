@@ -2,18 +2,28 @@
 
 # 一个超级可爱的，基于pi的agent工具，有着更多的功能和更加可爱的辉夜姬！
 
-## 安装方式：
+### 安装方式：
 
-## npm（需要 Node >=22.5）
+- npm（需要 Node >=22.5）
+
+```bash
 npm install --global ./dist/packages/tsukuyomi-0.6.2.tgz
+```
 
-## Fedora/RHEL/openSUSE
+- Fedora/RHEL/openSUSE
+
+```bash
 sudo dnf install ./dist/packages/tsukuyomi-0.6.2-1.x86_64.rpm
+```
 
-## Debian/Ubuntu
+- Debian/Ubuntu
+
+```bash
 sudo apt install ./dist/packages/tsukuyomi_0.6.2-1_amd64.deb
+```
 
-## Arch/CachyOS（本机）
+- Arch
+
+```bash  
 sudo pacman -U ./dist/packages/tsukuyomi-0.6.2-1-x86_64.pkg.tar.zst
-
-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
+```
