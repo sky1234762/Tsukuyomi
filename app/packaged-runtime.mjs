@@ -59,6 +59,10 @@ export function resolvePackagedExec({
 } = {}) {
 	if (env.TSUKUYOMI_USE_SOURCE === "1") return undefined;
 	if (currentRoot === PACKAGED_ROOT) return undefined;
+	// A source checkout with its own PI dependency must run the checkout so
+	// local app changes are visible. Fall back to the system bundle only when
+	// the checkout cannot provide a kernel of its own.
+	if (currentRoot && exists(join(currentRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "index.js"))) return undefined;
 	if (!exists(PACKAGED_NODE) || !exists(PACKAGED_ENTRY)) return undefined;
 	return {
 		node: PACKAGED_NODE,

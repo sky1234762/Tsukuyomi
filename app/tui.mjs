@@ -63,18 +63,20 @@ import { loadPreferences, savePreferences } from "./preferences.mjs";
 import { applySourceUpdate, checkForUpdates, formatUpdateDetails } from "./updater.mjs";
 import { filterSessionCatalog, scanSessionCatalog, trashSession } from "./session-store.mjs";
 import { listProviderConfigs, removeProviderConfig, saveProviderConfig } from "./providers/config/opencode.mjs";
-import { parseClaudeImport, parseCodexImport } from "./providers/config/native-import.mjs";
+import { parseCodexImport } from "./providers/config/native-import.mjs";
+import { buildCustomProvider } from "./providers/config/discovery.mjs";
 import { removeProviderFromModelsJson, syncAllToModelsJson, syncProviderToModelsJson, toProviderConfigInput } from "./providers/config/sync.mjs";
 import { ProviderUsageClient } from "./providers/usage.mjs";
 import { activeAccount, activateAccount, listAccounts, listAllAccounts, migrateAllCurrentCredentials, migrateCurrentCredential, saveAccount } from "./providers/accounts.mjs";
 import { syncCodexCredential } from "./providers/codex-auth.mjs";
 import { getStoredCredential } from "./providers/store.mjs";
-import { renderMarkdown, renderOutputBlock, renderStreamingCodeBlock, inlineAnsi, highlight, langFromPath } from "./markdown.mjs";
+import { expandTabs, renderMarkdown, renderMarkdownWithCode, renderOutputBlock, renderStreamingCodeBlock, inlineAnsi, highlight, langFromPath } from "./markdown.mjs";
 import { createTsukuyomiDesignSystem } from "./design-system.mjs";
 import { formatTime, formatAgo, formatDuration, TOOL_LABEL_KEYS, toolLabel } from "./tui/formatters.mjs";
 import { wideComposerGeometry } from "./tui/composer-layout.mjs";
 import { renderUserMessageBand } from "./tui/message-band.mjs";
 import { providerListWindow } from "./tui/provider-list-window.mjs";
+import { buildThinkingLevelMap, mergeDiscoveredModels, parseModelIds, providerSetupActions, supportedThinkingLevels, THINKING_LEVELS } from "./tui/provider-setup.mjs";
 import { matchesTuiAction, resolveTuiKeybindings } from "./tui/keybindings.mjs";
 import { HOME_AVATAR_HEIGHT, HOME_AVATAR_RGBA, HOME_AVATAR_WIDTH } from "./home-avatar.mjs";
 import { createExtensionDialogQueue } from "./tui/dialog-requests.mjs";
@@ -528,6 +530,15 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		userTurnCount: 0,
 		dirtyToolIds: new Set(),
 		mouseZones: [],
+		// Horizontal scroll offset per code block (keyed by the block id the
+		// renderer assigns) plus the block currently focused for keyboard
+		// scrolling. Long code lines are never wrapped; they are scrolled.
+		codeScroll: new Map(),
+		codeFocus: undefined,
+		codeBlockInfo: new Map(),
+		// Message indices whose code scroll changed since the last frame; the
+		// history cache re-renders only these instead of the whole transcript.
+		dirtyCodeIndices: new Set(),
 		primaryPastePending: false,
 		stopped: false,
 	};
@@ -692,30 +703,73 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		return lines;
 	};
 
-	// Markdown rendering is idempotent for a given (owner, value, width), so it
-	// can be memoized the same way as plain wrapping. The history cache rebuild
-	// already forces re-rendering on workflow changes; this avoids re-parsing
-	// large assistant messages on every unrelated render frame.
+	// Markdown rendering is idempotent for a given (owner, value, width, scroll),
+	// so it can be memoized the same way as plain wrapping. The history cache
+	// rebuild already forces re-rendering on workflow changes; this avoids
+	// re-parsing large assistant messages on every unrelated render frame.
 	const markdownMemo = new WeakMap();
-	const markdownCached = (owner, field, value, width) => {
-		if (!owner || typeof value !== "string") return renderMarkdown(value, { width });
+	// A code block's horizontal offset is part of its render, so a scrolled
+	// block re-parses its owning message while the rest of history is reused.
+	const codeScrollKey = (prefix) => {
+		if (!prefix) return "";
+		let key = "";
+		for (const id of [...state.codeScroll.keys()].sort()) {
+			// A block id is either the prefix itself (the streaming renderer owns a
+			// single block) or `prefix:<n>` (a parsed Markdown block).
+			if (id === prefix || id.startsWith(`${prefix}:`)) key += `${id}=${state.codeScroll.get(id)};`;
+		}
+		return key;
+	};
+	// A code block id is `m<messageIndex>:text:<n>`; scrolling it must re-render
+	// only the message that owns it.
+	const codeMessageIndex = (id) => {
+		const match = /^m(\d+):/.exec(id || "");
+		return match ? Number(match[1]) : -1;
+	};
+	const scrollCodeBlock = (id, delta, maxScroll) => {
+		if (!id) return false;
+		const limit = Math.max(0, Math.floor(maxScroll) || 0);
+		const current = state.codeScroll.get(id) || 0;
+		const next = Math.max(0, Math.min(limit, current + delta));
+		if (next === current) return false;
+		if (next === 0) state.codeScroll.delete(id);
+		else state.codeScroll.set(id, next);
+		const index = codeMessageIndex(id);
+		if (index >= 0) state.dirtyCodeIndices.add(index);
+		return true;
+	};
+	const resetCodeScroll = (id) => {
+		if (!id || !state.codeScroll.has(id)) return false;
+		state.codeScroll.delete(id);
+		const index = codeMessageIndex(id);
+		if (index >= 0) state.dirtyCodeIndices.add(index);
+		return true;
+	};
+	const markdownCached = (owner, field, value, width, codePrefix) => {
+		const scrollKey = codeScrollKey(codePrefix);
+		if (!owner || typeof value !== "string") {
+			const fresh = renderMarkdownWithCode(value, { width, codePrefix, scrolls: state.codeScroll, wrapCode: true });
+			return { rows: fresh.rows, codeBlocks: fresh.codeBlocks, scrollKey };
+		}
 		let slots = markdownMemo.get(owner);
 		if (!slots) { slots = new Map(); markdownMemo.set(owner, slots); }
 		const cached = slots.get(field);
-		if (cached && cached.width === width && cached.value === value) return cached.lines;
-		const lines = renderMarkdown(value, { width });
-		slots.set(field, { width, value, lines });
-		return lines;
+		if (cached && cached.width === width && cached.value === value && cached.scrollKey === scrollKey) return cached;
+		const fresh = renderMarkdownWithCode(value, { width, codePrefix, scrolls: state.codeScroll, wrapCode: true });
+		const entry = { width, value, scrollKey, rows: fresh.rows, codeBlocks: fresh.codeBlocks };
+		slots.set(field, entry);
+		return entry;
 	};
 
 	// Respect the Markdown preference. When enabled, chat text is returned as
 	// SGR-decorated rows (sgr: true) that must NOT be re-colored. When disabled,
 	// fall back to the plain wrapper the rest of the UI re-colors with color.text.
-	const textRows = (owner, field, value, width) => {
+	const textRows = (owner, field, value, width, codePrefix) => {
 		if (state.markdown) {
-			return { rows: owner ? markdownCached(owner, field, value, width) : renderMarkdown(value, { width }), sgr: true };
+			const rendered = markdownCached(owner, field, value, width, codePrefix);
+			return { rows: rendered.rows, sgr: true, codeBlocks: rendered.codeBlocks || [], scrollKey: rendered.scrollKey || "" };
 		}
-		return { rows: owner ? wrapCached(owner, field, value, width) : wrap(value, width), sgr: false };
+		return { rows: owner ? wrapCached(owner, field, value, width) : wrap(value, width), sgr: false, codeBlocks: [] };
 	};
 
 	// Markdown for tool output rows. Block-level Markdown does not fit the
@@ -725,7 +779,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 	// headers, metadata) keep their existing coloring. Disabled when Markdown is off.
 	const isReadLike = (name) => /^(read|view|cat|open|show|preview)$/i.test(name || "");
 	const toolRowContent = (row, tool, name) => {
-		const raw = String(row.text ?? "").replace(/[\r\n\t]/g, " ");
+		const raw = expandTabs(String(row.text ?? "").replace(/[\r\n]/g, " "));
 		if (!state.markdown || row.kind !== "text") return clean(raw);
 		const path = tool?.args?.path || tool?.args?.file;
 		const lang = path ? langFromPath(path) : undefined;
@@ -741,15 +795,16 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 	const renderToolRows = (tool, name, width) => {
 		const source = tool.rows(locale, tui.terminal.rows);
 		const header = source.find((row) => row.kind === "header");
+		const command = tool?.name === "bash" && tool?.args?.command ? String(tool.args.command) : "";
 		const footer = source.findLast((row) => row.kind === "footer");
 		const body = source.filter((row) => row !== header && row !== footer).map((row) => {
 			const content = toolRowContent(row, tool, name);
 			return toolRowPaint(row)(content || " ");
 		});
-		const sections = [{ lines: body }];
+		const sections = [{ lines: command ? [`$ ${command}`, ...body] : body }];
 		if (footer) sections.push({ lines: [toolRowPaint(footer)(toolRowContent(footer, tool, name))] });
 		return renderOutputBlock({
-			header: header ? toolRowContent(header, tool, name) : name || "tool",
+			header: header ? toolRowContent({ ...header, text: header.text.replace(command, "").replace(/\s+·\s+\d+s$/, "") }, tool, name) : name || "tool",
 			state: tool.status,
 			sections,
 			width: Math.max(8, width - 2),
@@ -1125,14 +1180,13 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 	};
 
 	const builtinNames = [
-		"new", "compact", "mode", "workspace", "files", "workflow", "todo", "sidebar", "model", "provider", "providers", "setup", "web-search", "queue",
-		"thinking", "tools", "skill", "sessions", "language", "status", "update", "accounts", "agents", "team", "touch", "help", "perf", "quit", "interrupt", "steer", "followup", "settings", "config",
+		"new", "compact", "mode", "workspace", "files", "workflow", "todo", "sidebar", "model", "provider", "web-search", "queue", "tasks",
+		"thinking", "tools", "skill", "sessions", "language", "status", "update", "accounts", "agents", "team", "touch", "help", "perf", "quit", "interrupt", "steer", "followup", "settings",
 	];
 	const builtinDescriptions = {
-		providers: "Open provider setup and sign-in",
-		setup: "Set up providers",
 		"web-search": "Choose the web_search provider",
 		queue: "Inspect queued steering and follow-up messages",
+		tasks: "Open the task and agent hub",
 	};
 	const makeBuiltins = () => builtinNames.map((name) => ({
 		name,
@@ -1394,7 +1448,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		tui.requestRender();
 	};
 
-	const openLocalSelect = ({ title, message, options, descriptions, selected = 0, kind = "select", onResolve, searchable, wide = false, sections, checked, onToggle, applyOption, onApply, setupWizard = false, setupTabs }) => {
+	const openLocalSelect = ({ title, message, options, descriptions, selected = 0, kind = "select", onResolve, searchable, wide = false, sections, checked, onToggle, applyOption, onApply, setupWizard = false, setupTabs, setupProviders }) => {
 		clearTerminalSelection();
 		state.pointer.cancel();
 		replaceDialog({
@@ -1407,6 +1461,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			wide,
 			setupWizard,
 			setupTabs,
+			setupProviders,
 			setupTab: 0,
 			onResolve,
 			checked,
@@ -1913,25 +1968,134 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			},
 		});
 	};
+	const persistCustomProvider = async (config, apiKey) => {
+		saveProviderConfig(agentDir, config.id, config);
+		syncProviderToModelsJson(agentDir, config.id, config);
+		await providers().registerProvider(config.id, toProviderConfigInput(config));
+		if (apiKey) await providers().saveApiKey(config.id, apiKey);
+		usageClient.clear();
+		toast(t("custom.saved", { provider: config.name || config.id }), "info");
+		setTimeout(() => shutdown(0, { restart: "provider", ...(state.sessionFile ? { session: state.sessionFile } : {}) }), 180);
+	};
+	const promptModelSelection = (providerId, candidates) => new Promise((resolve, reject) => {
+		const checked = new Set(candidates.map((model) => model.id));
+		const labels = candidates.map((model) => model.name && model.name !== model.id ? `${model.name} · ${model.id}` : model.id);
+		const apply = t("custom.modelsApply");
+		const descriptions = new Map(candidates.map((model, index) => [
+			labels[index],
+			model.name && model.name !== model.id ? model.id : t("custom.modelsToggleHint"),
+		]));
+		descriptions.set(apply, t("custom.modelsApplyHint"));
+		openLocalSelect({
+			title: t("custom.discoverTitle", { provider: providerId }),
+			message: t("custom.discoverMessage", { count: formatNumber(candidates.length, locale) }),
+			options: [...labels, apply],
+			descriptions,
+			kind: "multi",
+			searchable: true,
+			checked: (label) => checked.has(candidates[labels.indexOf(label)]?.id),
+			onToggle: (label) => {
+				const model = candidates[labels.indexOf(label)];
+				if (!model) return;
+				if (checked.has(model.id)) checked.delete(model.id);
+				else checked.add(model.id);
+			},
+			applyOption: apply,
+			onApply: () => {
+				clearDialog();
+				tui.requestRender();
+				resolve(candidates.filter((model) => checked.has(model.id)));
+			},
+			onResolve: (result) => { if (result?.cancelled) reject(new Error("Cancelled")); },
+		});
+	});
+	const promptThinkingLevelMap = (model) => new Promise((resolve, reject) => {
+		const existing = model?.thinkingLevelMap && typeof model.thinkingLevelMap === "object" ? model.thinkingLevelMap : undefined;
+		const supported = new Set(supportedThinkingLevels(existing));
+		const apply = t("custom.thinkingApply");
+		const descriptions = new Map(THINKING_LEVELS.map((level) => [
+			level,
+			existing && existing[level] != null && existing[level] !== level
+				? t("custom.thinkingMapped", { value: String(existing[level]) })
+				: t("custom.thinkingLevelHint"),
+		]));
+		descriptions.set(apply, t("custom.thinkingApplyHint"));
+		openLocalSelect({
+			title: t("custom.thinkingTitle", { model: model?.id || "" }),
+			message: t("custom.thinkingMessage"),
+			options: [...THINKING_LEVELS, apply],
+			descriptions,
+			kind: "multi",
+			checked: (level) => supported.has(level),
+			onToggle: (level) => {
+				if (supported.has(level)) supported.delete(level);
+				else supported.add(level);
+			},
+			applyOption: apply,
+			onApply: () => {
+				const map = buildThinkingLevelMap(supported, existing);
+				clearDialog();
+				tui.requestRender();
+				resolve(map);
+			},
+			onResolve: (result) => { if (result?.cancelled) reject(new Error("Cancelled")); },
+		});
+	});
+	const importCodexProvider = async () => {
+		const configuration = await localInputValue(t("custom.pasteConfig"), t("custom.pasteConfigHint"));
+		const credentials = await localInputValue(t("custom.pasteAuth"), t("custom.pasteAuthHint"), { secret: true });
+		const { config, credential } = parseCodexImport(configuration, credentials, { env });
+		await persistCustomProvider(config, credential.key);
+	};
+	const createSimpleProvider = async () => {
+		const id = (await localInputValue(t("custom.id"), t("custom.idHint"))).toLowerCase();
+		if (!/^[a-z0-9][a-z0-9_-]*$/.test(id)) throw new Error(t("custom.idInvalid"));
+		const fields = await promptCustomProviderFields({ id });
+		const { name, baseURL: baseUrl, api, apiKey } = fields;
+		const manual = await localInputValue(t("custom.modelList"), t("custom.modelListHint"));
+		const manualIds = parseModelIds(manual);
+		let discovered = [];
+		try {
+			discovered = (await buildCustomProvider({ id, name: name || id, baseUrl, api, apiKey }, { env })).models || [];
+		} catch (error) {
+			// A relay without a `/models` route is still usable when the user
+			// typed the ids by hand; otherwise the discovery error is the answer.
+			if (!manualIds.length) throw error;
+			toast(t("custom.discoverySkipped", { reason: error?.message || String(error) }), "warning", 8_000);
+		}
+		const candidates = mergeDiscoveredModels(manualIds, discovered);
+		if (!candidates.length) throw new Error(t("custom.noModelsDiscovered"));
+		const selected = await promptModelSelection(id, candidates);
+		if (!selected.length) throw new Error(t("custom.noModelsSelected"));
+		const config = await buildCustomProvider({ id, name: name || id, baseUrl, api, apiKey, models: selected }, { env });
+		await persistCustomProvider(config, apiKey);
+	};
 	const addCustomProvider = async () => {
 		try {
-			const protocol = await localSelectValue("Custom provider protocol", ["OpenAI-compatible · Codex", "Claude-compatible · Claude Code"]);
-			const openai = protocol.startsWith("OpenAI");
-			const configuration = await localInputValue(openai ? "Paste config.toml" : "Paste settings.json",
-				openai ? "Paste the complete Codex config.toml; Alt+Enter inserts a newline." : "Paste the complete Claude Code settings.json; Alt+Enter inserts a newline.");
-			const credentials = await localInputValue(openai ? "Paste auth.json" : "Paste credential JSON",
-				"The credential is saved in Tsukuyomi auth.json, never in providers.json.", { secret: true });
-			const imported = openai
-				? parseCodexImport(configuration, credentials, { env })
-				: parseClaudeImport(configuration, credentials);
-			const { config, credential } = imported;
-			saveProviderConfig(agentDir, config.id, config);
-			syncProviderToModelsJson(agentDir, config.id, config);
-			await providers().registerProvider(config.id, toProviderConfigInput(config));
-			await providers().saveApiKey(config.id, credential.key);
-			toast(t("custom.saved", { provider: config.name || config.id }), "info");
-			setTimeout(() => shutdown(0, { restart: "provider", ...(state.sessionFile ? { session: state.sessionFile } : {}) }), 180);
+			const mode = await localSelectValue(t("custom.addTitle"), [t("custom.modeSimple"), t("custom.modeImport")]);
+			if (mode === t("custom.modeImport")) await importCodexProvider();
+			else await createSimpleProvider();
 		} catch (error) { if (error?.message !== "Cancelled") toast(error?.message || String(error), "error"); }
+	};
+	const promptCustomProviderFields = async (current = {}) => {
+		const name = await localInputValue(t("custom.name"), t("custom.nameHint"), { prefill: current.name || current.id || "" });
+		const baseURL = await localInputValue(t("custom.baseUrl"), t("custom.baseUrlHint"), { prefill: current.baseURL || current.baseUrl || "" });
+		const apiOptions = ["openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai", "mistral-conversations"];
+		const api = await localSelectValue(t("custom.api"), apiOptions, Math.max(0, apiOptions.indexOf(current.api)));
+		const apiKey = await localInputValue(t("custom.apiKey"), t("custom.apiKeyHint"), { secret: true, prefill: current.apiKey || "" });
+		return { name: name || current.id, baseURL, api, apiKey };
+	};
+	const editCustomProvider = async (provider) => {
+		const current = customProviderConfig(provider.id);
+		const fields = await promptCustomProviderFields(current);
+		const updatedConfig = { ...current, ...fields };
+		saveProviderConfig(agentDir, current.id, updatedConfig);
+		syncProviderToModelsJson(agentDir, current.id, updatedConfig);
+		await providers().registerProvider(current.id, toProviderConfigInput(updatedConfig));
+		if (fields.apiKey) await providers().saveApiKey(current.id, fields.apiKey);
+		usageClient.clear();
+		toast(t("custom.updated", { provider: updatedConfig.name }), "info");
+		setTimeout(() => shutdown(0, { restart: "provider", ...(state.sessionFile ? { session: state.sessionFile } : {}) }), 180);
 	};
 	const customProviderConfig = (providerId) => {
 		const result = listProviderConfigs(agentDir);
@@ -1962,7 +2126,10 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		const name = await localInputValue(t("custom.modelName"), t("custom.modelNameHint"), { prefill: model.name || model.id || "" });
 		const reasoningOptions = [t("settings.on"), t("settings.off")];
 		const reasoning = await localSelectValue(t("custom.modelReasoning"), reasoningOptions, model.reasoning === true ? 0 : 1);
-		return { ...model, id, name: name || id, reasoning: reasoning === reasoningOptions[0] };
+		const next = { ...model, id, name: name || id, reasoning: reasoning === reasoningOptions[0] };
+		if (next.reasoning) next.thinkingLevelMap = await promptThinkingLevelMap({ ...next, id });
+		else delete next.thinkingLevelMap;
+		return next;
 	};
 	const openCustomProviderModels = (provider) => {
 		let config;
@@ -1971,8 +2138,13 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		const addLabel = t("custom.addModel");
 		const modelLabels = config.models.map((model) => `${model.name || model.id} · ${model.id}`);
 		const labels = [addLabel, ...modelLabels];
+		const thinkingSummary = (model) => {
+			const map = model.thinkingLevelMap;
+			if (!map || typeof map !== "object") return t("custom.reasoningOn");
+			return `${t("custom.reasoningOn")} · ${t("custom.thinkingLevelsCount", { count: formatNumber(supportedThinkingLevels(map).length, locale) })}`;
+		};
 		const descriptions = new Map(config.models.map((model, index) => [
-			modelLabels[index], model.reasoning ? t("custom.reasoningOn") : t("custom.reasoningOff"),
+			modelLabels[index], model.reasoning ? thinkingSummary(model) : t("custom.reasoningOff"),
 		]));
 		const message = t("custom.modelsMessage", { count: formatNumber(config.models.length, locale) });
 		openLocalSelect({
@@ -1999,13 +2171,30 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 				const model = config.models[modelLabels.indexOf(result?.value)];
 				if (!model) return;
 				const editLabel = t("custom.editModel");
+				const reasoningLabel = model.reasoning ? t("custom.thinkingLevels") : undefined;
 				const deleteLabel = t("custom.deleteModel");
 				openLocalSelect({
 					title: t("custom.modelActionsTitle", { model: model.id }),
-					options: [editLabel, deleteLabel],
-					descriptions: new Map([[editLabel, t("custom.editModelHint")], [deleteLabel, t("custom.deleteModelHint")]]),
+					options: [editLabel, ...(reasoningLabel ? [reasoningLabel] : []), deleteLabel],
+					descriptions: new Map([
+						[editLabel, t("custom.editModelHint")],
+						...(reasoningLabel ? [[reasoningLabel, t("custom.thinkingLevelsHint")]] : []),
+						[deleteLabel, t("custom.deleteModelHint")],
+					]),
 					onResolve: async (action) => {
 						if (action?.cancelled) { openCustomProviderModels(provider); return; }
+						if (action?.value === reasoningLabel) {
+							try {
+								const map = await promptThinkingLevelMap(model);
+								const current = customProviderConfig(provider.id).models;
+								const updated = await saveCustomProviderModels(provider.id, current.map((item) => item.id === model.id ? { ...item, thinkingLevelMap: map } : item));
+								toast(t("custom.modelsSaved", { count: updated.models.length, provider: updated.name || provider.id }), "info");
+							} catch (error) {
+								if (error?.message !== "Cancelled") toast(error?.message || String(error), "error");
+							}
+							openCustomProviderModels(provider);
+							return;
+						}
 						if (action?.value === editLabel) {
 							try {
 								const updatedModel = await promptCustomModel(model);
@@ -2060,6 +2249,23 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		});
 	};
 
+	const removeCustomProvider = async (provider) => {
+		openLocalSelect({
+			title: t("custom.removeTitle"),
+			message: t("custom.removeMessage", { provider: provider.name }),
+			kind: "confirm",
+			options: [t("action.yes"), t("action.no")],
+			onResolve: async (answer) => {
+				if (!answer?.confirmed) return;
+				removeProviderConfig(agentDir, provider.id);
+				removeProviderFromModelsJson(agentDir, provider.id);
+				await providers().unregisterProvider(provider.id).catch(() => {});
+				usageClient.clear();
+				toast(t("custom.removed", { provider: provider.name }), "info");
+				setTimeout(() => shutdown(0, { restart: "provider", ...(state.sessionFile ? { session: state.sessionFile } : {}) }), 180);
+			},
+		});
+	};
 	const openProviderSelector = async () => {
 		if (state.working || state.compacting) { toast(t("toast.abortWorkspace"), "warning"); return; }
 		toast(t("toast.loadingModels"), "info", 2_000);
@@ -2100,16 +2306,35 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		const currentSearch = String(loadPreferences(agentDir).webSearchProvider || "auto").toLowerCase();
 		const currentProviderIndex = list.findIndex((provider) => provider.id === state.model?.provider);
 		const selectedProviderIndex = currentProviderIndex < 0 ? 0 : currentProviderIndex + 1;
-		openLocalSelect({ title: t("dialog.provider"), message: t("dialog.providerMessage"), options: labels, descriptions, searchable: true, wide: true,
+		openLocalSelect({ title: t("dialog.provider"), message: t("dialog.providerMessage"), options: labels, descriptions, searchable: true, wide: true, setupProviders: list,
 			selected: selectedProviderIndex, setupWizard: true,
 			setupTabs: [
-				{ label: locale === "zh" ? "登录" : "Sign in", options: labels, descriptions, sections, selected: selectedProviderIndex },
+				{ label: locale === "zh" ? "登录" : "Sign in", options: labels, descriptions, sections, selected: selectedProviderIndex,
+					detailTitle: locale === "zh" ? "供应商操作" : "Provider actions",
+					detailOptions: providerSetupActions({
+						addLabel: t("custom.add"),
+						signInLabel: t("dialog.providerSignIn"),
+						editLabel: t("custom.editProvider"),
+						manageModelsLabel: t("custom.manageModels"),
+						removeLabel: t("custom.remove"),
+					}).map((action) => action.label),
+					detailHint: locale === "zh" ? "选择自定义供应商后，在此编辑配置、管理模型或删除供应商。" : "Select a custom provider to edit its configuration, manage models, or remove it." },
 				{ label: locale === "zh" ? "网页搜索" : "Web search", options: webSearchProviders, descriptions: searchDescriptions, selected: Math.max(0, webSearchProviders.findIndex((item) => item.toLowerCase() === currentSearch)) },
 			],
 			onResolve: async (result) => {
 				if (result?.setupTab === 1) {
 					if (!savePreferences(agentDir, { webSearchProvider: String(result.value).toLowerCase() })) toast("Could not save web search provider", "error");
 					else toast(`web_search: ${result.value}`, "info");
+					return;
+				}
+				if (result?.setupAction) {
+					const provider = list.find((item) => item.id === result.setupProviderId);
+					if (result.setupAction === t("custom.add")) { await addCustomProvider(); return; }
+					if (result.setupAction === t("dialog.providerSignIn")) { if (provider) openProviderAuth(provider); return; }
+					if (!provider?.custom) return;
+					if (result.setupAction === t("custom.editProvider")) { try { await editCustomProvider(provider); } catch (error) { if (error?.message !== "Cancelled") toast(error?.message || String(error), "error"); } }
+					else if (result.setupAction === t("custom.manageModels")) openCustomProviderModels(provider);
+					else if (result.setupAction === t("custom.remove")) removeCustomProvider(provider);
 					return;
 				}
 				if (result?.value === addLabel) { await addCustomProvider(); return; }
@@ -2122,9 +2347,12 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 					const accountLabels = accounts.map((account) => `${account.id === current ? "● " : "○ "}${account.name}`);
 					accountLabels.push("+ Add account");
 					const manageModels = provider.custom ? t("custom.manageModels") : undefined;
+					const editProvider = provider.custom ? t("custom.editProvider") : undefined;
 					if (manageModels) accountLabels.push(manageModels);
+					if (editProvider) accountLabels.push(editProvider);
 					openLocalSelect({ title: `${provider.name} accounts`, options: accountLabels, onResolve: async (choice) => {
 						if (choice?.value === manageModels) return openCustomProviderModels(provider);
+						if (choice?.value === editProvider) { try { await editCustomProvider(provider); } catch (error) { if (error?.message !== "Cancelled") toast(error?.message || String(error), "error"); } return; }
 						if (choice?.value === "+ Add account") return openProviderAuth(provider);
 						const account = accounts[accountLabels.indexOf(choice?.value)];
 						if (account && activateAccount(agentDir, provider.id, account.id)) shutdown(0, { restart: "provider", ...(state.sessionFile ? { session: state.sessionFile } : {}) });
@@ -2141,10 +2369,12 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 				const signIn = t("dialog.providerSignIn");
 				const signOut = t("auth.signOut");
 				const manageModels = provider.custom ? t("custom.manageModels") : undefined;
+				const editProvider = provider.custom ? t("custom.editProvider") : undefined;
 				const remove = provider.custom ? t("custom.remove") : undefined;
-				const options = [...modelLabels, ...(manageModels ? [manageModels] : []), signIn, ...(provider.custom && !auth.configured ? [] : [signOut]), ...(remove ? [remove] : [])];
+				const options = [...modelLabels, ...(editProvider ? [editProvider] : []), ...(manageModels ? [manageModels] : []), signIn, ...(provider.custom && !auth.configured ? [] : [signOut]), ...(remove ? [remove] : [])];
 				const descriptions = new Map([
 					...models.map((model, index) => [modelLabels[index], model.name || model.id]),
+					...(editProvider ? [[editProvider, t("custom.editProviderHint")]] : []),
 					...(manageModels ? [[manageModels, t("custom.manageModelsHint")]] : []),
 					[signIn, t("auth.accountLogin")],
 					...(!(provider.custom && !auth.configured) ? [[signOut, t("auth.signOutHint")]] : []),
@@ -2153,25 +2383,9 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 				openLocalSelect({ title: t("dialog.model"), message: t("dialog.modelMessage", { count: formatNumber(models.length, locale) }), options, descriptions,
 					selected: Math.max(0, modelLabels.indexOf(`${state.model?.provider}/${state.model?.id}`)),
 					onResolve: async (choice) => {
+						if (choice?.value === editProvider) { try { await editCustomProvider(provider); } catch (error) { if (error?.message !== "Cancelled") toast(error?.message || String(error), "error"); } return; }
 						if (choice?.value === manageModels) { openCustomProviderModels(provider); return; }
-						if (choice?.value === remove) {
-							openLocalSelect({
-								title: t("custom.removeTitle"),
-								message: t("custom.removeMessage", { provider: provider.name }),
-								kind: "confirm",
-								options: [t("action.yes"), t("action.no")],
-								onResolve: async (answer) => {
-									if (!answer?.confirmed) return;
-									removeProviderConfig(agentDir, provider.id);
-									removeProviderFromModelsJson(agentDir, provider.id);
-									await providers().unregisterProvider(provider.id).catch(() => {});
-									usageClient.clear();
-									toast(t("custom.removed", { provider: provider.name }), "info");
-									setTimeout(() => shutdown(0, { restart: "provider", ...(state.sessionFile ? { session: state.sessionFile } : {}) }), 180);
-								},
-							});
-							return;
-						}
+						if (choice?.value === remove) { removeCustomProvider(provider); return; }
 						if (choice?.value === signOut) {
 							await providers().logout(provider.id);
 							usageClient.clear();
@@ -2263,7 +2477,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 							onResolve: (accountResult) => {
 								const accountIndex = accountLabels.indexOf(accountResult?.value) - 1;
 								const accountRef = accountIndex >= 0 ? { providerId: model.provider, id: accounts[accountIndex].id } : undefined;
-								const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+								const levels = THINKING_LEVELS;
 								openLocalSelect({
 									title: locale === "zh" ? "思考强度" : "Thinking level",
 									options: levels,
@@ -2351,6 +2565,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			message: locale === "zh" ? "空格切换开启/关闭；选择最后一项应用。关闭的 Skill 不会加载到模型上下文，也不能通过 /skill:name 调用。" : "Space toggles enablement; choose the last item to apply. Disabled skills are not loaded or invokable.",
 			options: [...labels, apply],
 			descriptions,
+			kind: "multi",
 			searchable: true,
 			checked: (name) => pending.get(name) === true,
 			onToggle: (name) => {
@@ -2764,7 +2979,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			if (!rest) { toast(t("toast.interruptUsage"), "warning"); return; }
 			return interruptAndSend(rest);
 		}
-		if (command === "quit" || command === "exit") return shutdown(0);
+		if (command === "quit") return shutdown(0);
 		if (command === "help") {
 			toast(t("toast.help"), "info", 10_000);
 			return;
@@ -2800,19 +3015,19 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		}
 		if (command === "mode") return rest ? setMode(rest.toLowerCase()) : openModeSelector();
 		if (command === "workspace") return chooseWorkspace(rest);
-		if (command === "language" || command === "lang") return rest ? setLocale(rest) : openLanguageSelector();
+		if (command === "language") return rest ? setLocale(rest) : openLanguageSelector();
 		if (command === "status") return openStatus(["refresh", "force"].includes(rest.toLowerCase()));
-		if (command === "settings" || command === "config") { activate(); return openSettings(); }
+		if (command === "settings") { activate(); return openSettings(); }
 		if (command === "update") return promptForUpdate();
-		if (command === "accounts" || command === "account") {
+		if (command === "accounts") {
 			try { await openAccounts(); } catch (error) { toast(redactText(error?.message || String(error)), "error"); }
 			return;
 		}
-		if (command === "agents" || command === "agent") {
+		if (command === "agents") {
 			try { openAgents(); } catch (error) { toast(redactText(error?.message || String(error)), "error"); }
 			return;
 		}
-		if (command === "skill" || command === "skills") {
+		if (command === "skill") {
 			openSkills(rest);
 			return;
 		}
@@ -2840,7 +3055,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			} catch {}
 			return;
 		}
-		if (command === "compact" || command === "kcompact") {
+		if (command === "compact") {
 			activate();
 			state.compacting = true; state.compactStatus = `${t("status.compactingShort")} · ${t("action.start").toLowerCase()}`; tui.requestRender();
 			try { await request({ type: "compact", ...(rest ? { customInstructions: rest } : {}) }); }
@@ -2863,8 +3078,8 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			} catch {}
 			return;
 		}
-		if (command === "provider" || command === "providers" || command === "setup") { try { await openProviderSelector(); } catch (error) { toast(redactText(error?.message || String(error)), "error"); } return; }
-		if (command === "web-search" || command === "web_search") { openWebSearchSelector(); return; }
+		if (command === "provider") { try { await openProviderSelector(); } catch (error) { toast(redactText(error?.message || String(error)), "error"); } return; }
+		if (command === "web-search") { openWebSearchSelector(); return; }
 		if (command === "queue") {
 			const queued = [...state.queueItems.steering.map((item) => `↪ ${item}`), ...state.queueItems.followUp.map((item) => `+ ${item}`)];
 			replaceDialog({ source: "local", kind: "status", title: "Queue", message: queued.join("\n") || (locale === "zh" ? "队列为空" : "Queue is empty"), options: [] });
@@ -2975,58 +3190,55 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 
 	const settingsBool = (value) => value ? t("settings.on") : t("settings.off");
 	const settingsGroups = () => ([
-		{ header: "🎨 Appearance", items: [
+		{ header: t("settings.groupAppearance"), items: [
 			{ id: "language", label: t("settings.language"), detail: languageName() },
 			{ id: "sidebar", label: t("settings.rightSidebar"), detail: settingsBool(state.showWorkflow || state.showTodos), toggle: true },
 			{ id: "markdown", label: t("settings.markdown"), detail: settingsBool(state.markdown), toggle: true },
 		] },
-		{ header: "🤖 Model", items: [
+		{ header: t("settings.groupModel"), items: [
 			{ id: "model", label: t("settings.model"), detail: state.model?.id || t("status.noModel") },
 			{ id: "thinkingLevel", label: t("command.thinking"), detail: state.thinking },
 		] },
-		{ header: "⌨ Interaction", items: [
+		{ header: t("settings.groupInteraction"), items: [
 			{ id: "thinking", label: t("settings.thinking"), detail: settingsBool(state.thinkingAutoCollapse), toggle: true },
 			{ id: "touch", label: t("settings.touch"), detail: settingsBool(state.touchMode), toggle: true },
 			{ id: "keybindings", label: t("settings.keybindings"), detail: t(state.keybindingPreset === "omp" ? "settings.keybindingsOmp" : "settings.keybindingsLegacy") },
 			{ id: "mode", label: t("command.mode"), detail: t(`mode.${state.mode}`) },
 		] },
-		{ header: "📋 Context", items: [
+		{ header: t("settings.groupContext"), items: [
 			{ id: "compact", label: t("command.compact") },
 			{ id: "status", label: t("command.status") },
 		] },
-		{ header: "🧠 Memory", items: [
+		{ header: t("settings.groupMemory"), items: [
 			{ id: "sessions", label: t("command.sessions") },
 			{ id: "new", label: t("command.new") },
 		] },
-		{ header: "📁 Files", items: [
+		{ header: t("settings.groupFiles"), items: [
 			{ id: "workspace", label: t("command.workspace"), detail: compactPath(cwd) },
 		] },
-		{ header: "💻 Shell", items: [
-			{ id: "tools", label: t("command.tools") },
-		] },
-		{ header: "🔧 Tools", items: [
+		{ header: t("settings.groupToolsSection"), items: [
 			{ id: "tools", label: t("command.tools") },
 			{ id: "webSearch", label: "Web search", detail: "Auto / Parallel / Perplexity / Gemini / Anthropic / OpenAI / xAI / OpenRouter" },
 		] },
-		{ header: "📦 Tasks", items: [
+		{ header: t("settings.groupTasks"), items: [
 			{ id: "team", label: t("command.team") },
 			{ id: "agents", label: t("command.agents") },
 		] },
-		{ header: "🌐 Providers", items: [
+		{ header: t("settings.groupProviders"), items: [
 			{ id: "provider", label: t("settings.provider"), detail: state.model?.provider || t("status.notAvailable") },
 			{ id: "accounts", label: t("settings.accounts"), detail: t("settings.accountsHint") },
 			{ id: "customModels", label: t("custom.modelsSettings"), detail: t("custom.modelsSettingsHint") },
 			{ id: "customProvider", label: t("custom.add") },
 		] },
-		{ header: "📦 Plugins", items: [
+		{ header: t("settings.groupPlugins"), items: [
 			{ id: "skills", label: t("command.skill") },
 		] },
-		{ header: "◉ Agents", items: [
+		{ header: t("settings.groupAgents"), items: [
 			...listAgents(agentDir).map((agent) => ({ id: `agent:${agent.id}`, label: agent.name, detail: `${agent.provider}/${agent.model} · ${agent.thinking}` })),
 			{ id: "agents", label: locale === "zh" ? "＋ 新建 Agent" : "＋ New agent" },
 			{ id: "team", label: locale === "zh" ? "团队协作设置" : "Agent team settings" },
 		] },
-		{ header: "ⓘ About", items: [
+		{ header: t("settings.groupAbout"), items: [
 			{ id: "update", label: t("command.update") },
 			{ id: "help", label: t("command.help") },
 			{ id: "version", label: t("settings.version"), detail: `v${version}` },
@@ -3122,7 +3334,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		const key = `${width}\u0000${line}`;
 		const cached = paintedRowCache.get(key);
 		if (cached !== undefined) return cached;
-		const painted = blackBackground(pad(line.replace(/[\r\n\t]/g, " "), width));
+		const painted = blackBackground(pad(expandTabs(line.replace(/[\r\n]/g, " ")), width));
 		paintedRowCache.set(key, painted);
 		return painted;
 	};
@@ -3238,6 +3450,8 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 				lastThoughtMs: state.lastThoughtMs,
 				now: Date.now(),
 				dirtyToolIds: state.dirtyToolIds,
+				dirtyCodeIndices: state.dirtyCodeIndices,
+				codeScrollKey: (index) => codeScrollKey(`m${index}:text`),
 				renderMessage: (index) => this.#renderMessageSegment(cache, index, inner, width),
 			});
 			perf.segments += cache.rendered;
@@ -3249,6 +3463,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			const tailSegments = [];
 			let tailLength = 0;
 			const tailRanges = [];
+			const tailCodeBlocks = [];
 			const renderedTailTools = new Set();
 			const pushTailSegment = (rows, paint) => {
 				if (!rows.length) return;
@@ -3282,35 +3497,57 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			}
 			// Streaming text is wrapped incrementally: only the trailing partial line
 			// is reprocessed when a token arrives, instead of the whole response.
-			const phaseRows = (phase, phaseWidth) => {
+			const phaseRows = (phase, phaseWidth, phaseCodePrefix) => {
 				if (state.markdown) {
+					const collect = [];
+					// The streaming renderer owns exactly one block; name it like the
+					// first block the full Markdown renderer would produce so the
+					// offset survives the switch to mixed content.
+					const streamingId = `${phaseCodePrefix}:0`;
 					const streamingCode = renderStreamingCodeBlock(phase.text || "", {
 						width: phaseWidth,
 						streamState: phase.highlightState ||= {},
+						id: streamingId,
+						collect,
+						scrollX: state.codeScroll.get(streamingId) || 0,
 					});
-					if (streamingCode) return streamingCode;
+					if (streamingCode) return { rows: streamingCode, codeBlocks: collect, sgr: true };
 					if (/^\s*(`{3,}|~{3,})/m.test(phase.text || "")) {
-						const key = `${phaseWidth}\0${phase.text || ""}`;
+						const key = `${phaseWidth}\0${phase.text || ""}\0${codeScrollKey(phaseCodePrefix)}`;
 						if (phase.markdownKey !== key) {
 							phase.markdownKey = key;
-							phase.markdownRows = renderMarkdown(phase.text || "", { width: phaseWidth });
+							const rendered = renderMarkdownWithCode(phase.text || "", { width: phaseWidth, codePrefix: phaseCodePrefix, scrolls: state.codeScroll, wrapCode: true });
+							phase.markdownRows = rendered.rows;
+							phase.markdownBlocks = rendered.codeBlocks;
 						}
-						return phase.markdownRows;
+						return { rows: phase.markdownRows, codeBlocks: phase.markdownBlocks || [] };
 					}
 				}
 				if (!phase.inc) {
 					phase.inc = new IncrementalText(wrap);
 					phase.inc.append(phase.text || "");
 				}
-				return phase.inc.rows(phaseWidth);
+				return { rows: phase.inc.rows(phaseWidth), codeBlocks: [] };
 			};
-			for (const phase of state.stream) {
+			for (let phaseIndex = 0; phaseIndex < state.stream.length; phaseIndex++) {
+				const phase = state.stream[phaseIndex];
+				const phaseCodePrefix = `stream:${phaseIndex}:${phase.kind}`;
 				if (phase.kind === "thinking") {
 					const elapsed = phase.startAt ? formatDuration((Date.now() - phase.startAt) / 1000, locale) : "";
 					pushTailSegment([`  ${color.muted("◆")} ${bold(color.muted(t("status.thought")))}${elapsed ? color.dim(` · ${elapsed}`) : ""}`], (line) => line);
-					pushTailSegment(phaseRows(phase, Math.max(4, inner - 6)), (line) => `    ${color.muted(line || " ")}`);
+					const start = tailLength;
+					const { rows: thoughtRows, codeBlocks: thoughtBlocks, sgr: thoughtSgr } = phaseRows(phase, Math.max(4, inner - 6), phaseCodePrefix);
+					pushTailSegment(thoughtRows, (line) => `    ${thoughtSgr ? (line || " ") : color.muted(line || " ")}`);
+					for (const block of thoughtBlocks || []) {
+						tailCodeBlocks.push({ ...block, start: start + block.rowStart, end: start + block.rowEnd, indent: (block.indent || 0) + 4 });
+					}
 				} else if (phase.kind === "text") {
-					pushTailSegment(phaseRows(phase, Math.max(4, inner - 2)), (line) => `  ${color.text(line || " ")}`);
+					const start = tailLength;
+					const { rows: textRowsForPhase, codeBlocks: textBlocks, sgr: textSgr } = phaseRows(phase, Math.max(4, inner - 2), phaseCodePrefix);
+					pushTailSegment(textRowsForPhase, (line) => `  ${textSgr ? (line || " ") : color.text(line || " ")}`);
+					for (const block of textBlocks || []) {
+						tailCodeBlocks.push({ ...block, start: start + block.rowStart, end: start + block.rowEnd, indent: (block.indent || 0) + 2 });
+					}
 				} else if (phase.kind === "tool") {
 					appendTailTool(phase.id, state.liveTools.get(phase.id)?.name || phase.label);
 				}
@@ -3323,6 +3560,9 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			const toolRanges = tailRanges.length
 				? cache.toolRanges.concat(tailRanges.map((range) => ({ id: range.id, start: range.start + base, end: range.end + base })))
 				: cache.toolRanges;
+			const codeBlocks = tailCodeBlocks.length
+				? (cache.codeBlocks || []).concat(tailCodeBlocks.map((block) => ({ ...block, start: block.start + base, end: block.end + base })))
+				: (cache.codeBlocks || []);
 			return {
 				history: cache,
 				tail: tailSegments,
@@ -3332,6 +3572,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 				userBlocks: cache.userBlocks,
 				blockIndex: cache.blockIndex,
 				toolRanges,
+				codeBlocks,
 			};
 		}
 
@@ -3342,6 +3583,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			if (message.role === "user" && index === cache.omitUserIndex) return;
 			const lines = [];
 			const localToolRanges = [];
+			const localCodeBlocks = [];
 			let block;
 			const isLastAssistant = index === cache.lastAssistantIndex;
 			if (message.role === "user") {
@@ -3372,7 +3614,8 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 					if (!(part.text || "").trim()) continue;
 					const allowTime = firstTextRow && timeWidth > 0;
 					const wrapWidth = allowTime ? Math.max(4, inner - timeWidth - 4) : Math.max(4, inner - 2);
-					const { rows: textLines, sgr: textSgr } = textRows(part, "text", part.text, wrapWidth);
+					const { rows: textLines, sgr: textSgr, codeBlocks: textCodeBlocks } = textRows(part, "text", part.text, wrapWidth, `m${index}:text`);
+					const textStart = lines.length;
 					for (const line of textLines) {
 						let row = `  ${textSgr ? (line || " ") : color.text(line || " ")}`;
 						if (allowTime && firstTextRow) {
@@ -3380,6 +3623,12 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 							row = pad(row, Math.max(1, width - timeWidth)) + timeText;
 						}
 						lines.push(row);
+					}
+					// Record each code block's absolute row range so the transcript
+					// can hit-test it and remember its horizontal offset. The two
+					// spaces the text part prefixes shift the frame's indent.
+					for (const block of textCodeBlocks || []) {
+						localCodeBlocks.push({ ...block, start: textStart + block.rowStart, end: textStart + block.rowEnd, indent: (block.indent || 0) + 2 });
 					}
 				} else if (part.type === "toolCall" && part.name !== "todo") {
 						const id = part.id || part.toolCallId;
@@ -3413,9 +3662,10 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 				const visible = output.slice(-20).map((line) => color.muted(line || " "));
 				if (output.length > visible.length) visible.unshift(color.dim(`… ${output.length - visible.length} earlier lines`));
 				lines.push(...renderOutputBlock({
-					header: `$ ${message.command || ""}`,
+					header: "bash",
+					meta: "command",
+					sections: [{ lines: [`$ ${message.command || ""}`, ...visible] }],
 					state: Number(message.exitCode) ? "error" : "done",
-					sections: [{ lines: visible }],
 					width: Math.max(8, inner - 2),
 				}).map((line) => `  ${line}`));
 				lines.push("");
@@ -3424,7 +3674,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			} else {
 				return;
 			}
-			return { lines, block, localToolRanges };
+			return { lines, block, localToolRanges, localCodeBlocks };
 		}
 
 		// Materialize only the requested window from the immutable per-message
@@ -3943,37 +4193,57 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			const active = Math.max(0, Math.min(tabs.length - 1, dialog.activeTab || 0));
 			const title = `  ${bold(color.accent(dialog.title || t("settings.title")))}`;
 			const close = color.dim("[×]");
-			next[0] = menuBackground(pad(`${title}${" ".repeat(Math.max(1, width - visibleWidth(title) - visibleWidth(close) - 1))}${close} `, width));
+			const fittedTitle = truncateToWidth(title, Math.max(1, width - visibleWidth(close) - 1), "…");
+			const titleGap = " ".repeat(Math.max(0, width - visibleWidth(fittedTitle) - visibleWidth(close) - 1));
+			next[0] = menuBackground(pad(`${fittedTitle}${titleGap}${close} `, width));
 			dialog.mouseTabs = [];
-			let first = Math.max(0, active - 2);
+			const tabCells = tabs.map((tab, index) => ({
+				index,
+				text: ` ${tab.header} `,
+				width: visibleWidth(` ${tab.header} `),
+			}));
+			const tabLimit = Math.max(1, width - 1);
+			let first = active;
+			let last = active;
+			let total = tabCells[active].width;
+			while (first > 0 && total + tabCells[first - 1].width <= tabLimit) {
+				first--;
+				total += tabCells[first].width;
+			}
+			while (last + 1 < tabCells.length && total + tabCells[last + 1].width <= tabLimit) {
+				last++;
+				total += tabCells[last].width;
+			}
+			const visibleTabs = tabCells.slice(first, last + 1);
 			let tabText = " ";
-			for (let index = first; index < tabs.length; index++) {
-				const label = tabs[index].header;
-				const cell = ` ${label} `;
-				if (visibleWidth(tabText) + visibleWidth(cell) >= width - 2) break;
+			for (const tab of visibleTabs) {
+				const cell = tab.text;
 				const x = visibleWidth(tabText);
-				dialog.mouseTabs.push({ x, width: visibleWidth(cell), index });
-				tabText += index === active ? listSelection(bold(color.text(cell))) : color.muted(cell);
+				dialog.mouseTabs.push({ x, width: tab.width, index: tab.index });
+				tabText += tab.index === active ? listSelection(bold(color.text(cell))) : color.muted(cell);
 			}
 			if (height > 1) next[1] = menuBackground(pad(tabText, width));
-			if (height > 3) next[3] = menuBackground(`  ${bold(color.text(tabs[active]?.header || ""))}`);
-			const leftWidth = Math.max(16, Math.min(28, Math.floor(width * 0.25)));
+			if (height > 3) next[3] = menuBackground(pad(truncateToWidth(`  ${bold(color.text(tabs[active]?.header || ""))}`, width, "…"), width));
+			const leftWidth = Math.max(1, Math.min(28, Math.floor(width * 0.25), Math.max(1, width - 5)));
 			const rows = dialog.settingsRows || [];
-			const firstRow = Math.max(0, Math.min(Math.max(0, rows.length - Math.max(1, height - 7)), (dialog.selected || 0) - Math.floor(Math.max(1, height - 7) / 2)));
+			const listTop = Math.min(height, 5);
+			const listBottom = Math.max(listTop, height - 2);
+			const listCapacity = Math.max(0, listBottom - listTop);
+			const firstRow = Math.max(0, Math.min(Math.max(0, rows.length - listCapacity), (dialog.selected || 0) - Math.floor(listCapacity / 2)));
 			dialog.mouseRows = [];
-			for (let offset = 0; offset < height - 7 && firstRow + offset < rows.length; offset++) {
+			for (let offset = 0; offset < listCapacity && firstRow + offset < rows.length; offset++) {
 				const item = rows[firstRow + offset].item;
 				if (!item) continue;
-				const y = 5 + offset;
+				const y = listTop + offset;
 				const selected = item.index === dialog.selected;
 				const marker = item.toggle ? (item.detail === t("settings.on") ? "◉" : "○") : "›";
 				const left = truncateToWidth(`${selected ? "❯" : " "} ${marker} ${item.label}`, leftWidth - 2, "…");
-				const right = truncateToWidth(item.detail || "", Math.max(1, width - leftWidth - 4), "…");
-				const line = pad(` ${pad(left, leftWidth - 1)} ${color.dim(right)}`, width);
+				const right = truncateToWidth(item.detail || "", Math.max(1, width - leftWidth - 3), "…");
+				const line = pad(`${pad(left, leftWidth)}${right ? ` ${color.dim(right)}` : ""}`, width);
 				next[y] = selected ? listSelection(line) : menuBackground(line);
 				dialog.mouseRows.push({ y, index: item.index });
 			}
-			if (height > 2) next[height - 2] = menuBackground(`  ${color.dim("←/→ or Tab: sections · ↑/↓: options · Enter: change · Esc: close")}`);
+			if (height > 2) next[height - 2] = menuBackground(pad(truncateToWidth(`  ${color.dim(t("settings.footer"))}`, width, "…"), width));
 			dialog.mouseClose = { x: Math.max(0, width - 6), y: 0, width: 5, height: 1 };
 			dialog.mouseBox = { x: 0, y: 0, width, height };
 			return next;
@@ -3981,7 +4251,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 
 		#drawProviderSetup(width, height, dialog) {
 			const next = Array.from({ length: height }, () => blackBackground(" ".repeat(width)));
-			const baseRow = (value = "") => blackBackground(pad(value, width));
+			const baseRow = (value = "") => blackBackground(pad(truncateToWidth(value, width, "…"), width));
 			const tabs = dialog.setupTabs || [];
 			const compact = height < 25 || width < 72;
 			let cursorY = 0;
@@ -4027,19 +4297,63 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			const selectedDescription = dialog.setupTab === 1 ? dialog.descriptions?.get(options[selected]) : undefined;
 			const rowEntries = providerListWindow({ options, sections: dialog.sections, selectedIndex: selected, rowCount: availableRows, selectedDescription });
 			dialog.mouseRows = [];
-			let rowY = listTop;
-			for (const entry of rowEntries) {
-				if (rowY >= listBottom) break;
-				if (entry.kind === "option") {
-					const chosen = entry.index === selected;
-					const marker = chosen ? color.accent("❯") : " ";
-					const label = truncateToWidth(entry.value, Math.max(1, width - 8), "…");
-					const line = `${marker} ${label}`;
-					next[rowY] = chosen ? blackBackground(`  ${listSelection(pad(line, width - 4))}  `) : baseRow(`  ${color.text(line)}`);
-					dialog.mouseRows.push({ y: rowY, index: entry.index });
-				} else if (entry.kind === "section") next[rowY] = baseRow(`  ${color.secondary(entry.section)}`);
-				else if (entry.kind === "description") next[rowY] = baseRow(`    ${color.dim(entry.text)}`);
-				rowY++;
+			const wideProviderLayout = dialog.setupTab === 0 && width >= 94 && !compact;
+			if (wideProviderLayout) {
+				const paneWidth = Math.max(28, Math.floor((width - 5) * 0.56));
+				const detailWidth = Math.max(24, width - paneWidth - 3);
+				dialog.setupPane = dialog.setupPane || "list";
+				const selectedProviderId = options[selected]?.split(" · ").pop();
+				const selectedProvider = dialog.setupProviders?.find((provider) => provider.id === selectedProviderId);
+				const detailOptions = providerSetupActions({
+					provider: selectedProvider,
+					addLabel: t("custom.add"),
+					signInLabel: t("dialog.providerSignIn"),
+					editLabel: t("custom.editProvider"),
+					manageModelsLabel: t("custom.manageModels"),
+					removeLabel: t("custom.remove"),
+				}).map((action) => action.label);
+				dialog.setupDetailOptions = detailOptions;
+				const detailSelected = Math.max(0, Math.min(Math.max(0, detailOptions.length - 1), dialog.setupDetailSelected || 0));
+				dialog.setupDetailSelected = detailSelected;
+				const leftRows = rowEntries;
+				const leftLines = [];
+				for (const entry of leftRows) {
+					if (entry.kind === "option") {
+						const chosen = entry.index === selected;
+						const marker = chosen ? color.accent("❯") : " ";
+						leftLines.push(chosen ? listSelection(pad(`${marker} ${truncateToWidth(entry.value, paneWidth - 5, "…")}`, paneWidth - 2)) : color.text(`  ${truncateToWidth(entry.value, paneWidth - 4, "…")}`));
+						dialog.mouseRows.push({ y: listTop + leftLines.length - 1, index: entry.index });
+					} else if (entry.kind === "section") leftLines.push(color.secondary(`  ${truncateToWidth(entry.section, paneWidth - 4, "…")}`));
+					else leftLines.push(color.dim(`    ${truncateToWidth(entry.text, paneWidth - 6, "…")}`));
+				}
+				const rightLines = [bold(color.accent(dialog.setupTabs[0]?.detailTitle || (locale === "zh" ? "供应商操作" : "Provider actions"))), "", selectedProvider ? color.text(selectedProvider.name || selectedProvider.id) : color.dim(locale === "zh" ? "请选择供应商" : "Select a provider")];
+				if (selectedProvider) rightLines.push(color.dim(selectedProvider.id));
+				for (let index = 0; index < detailOptions.length; index++) rightLines.push(index === detailSelected && dialog.setupPane === "detail" ? listSelection(` ${detailOptions[index]} `) : `  ${color.text(detailOptions[index])}`);
+				if (!detailOptions.length) rightLines.push(color.dim(dialog.setupTabs[0]?.detailHint || ""));
+				for (let offset = 0; offset < availableRows; offset++) {
+					const y = listTop + offset;
+					const left = leftLines[offset] || "";
+					const right = rightLines[offset] || "";
+					next[y] = baseRow(`${pad(left, paneWidth)} ${color.dim("│")} ${pad(truncateToWidth(right, detailWidth - 1), detailWidth - 1)}`);
+				}
+				dialog.setupPaneX = paneWidth + 2;
+				dialog.setupPaneY = listTop;
+				dialog.setupPaneWidth = detailWidth;
+			} else {
+				let rowY = listTop;
+				for (const entry of rowEntries) {
+					if (rowY >= listBottom) break;
+					if (entry.kind === "option") {
+						const chosen = entry.index === selected;
+						const marker = chosen ? color.accent("❯") : " ";
+						const label = truncateToWidth(entry.value, Math.max(1, width - 8), "…");
+						const line = `${marker} ${label}`;
+						next[rowY] = chosen ? blackBackground(`  ${listSelection(pad(line, width - 4))}  `) : baseRow(`  ${color.text(line)}`);
+						dialog.mouseRows.push({ y: rowY, index: entry.index });
+					} else if (entry.kind === "section") next[rowY] = baseRow(`  ${color.secondary(entry.section)}`);
+					else if (entry.kind === "description") next[rowY] = baseRow(`    ${color.dim(entry.text)}`);
+					rowY++;
+				}
 			}
 			dialog.mouseBox = { x: 0, y: 0, width, height };
 			dialog.mouseClose = { x: Math.max(0, width - 5), y: 0, width: 4, height: 1 };
@@ -4859,6 +5173,30 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 				if (end <= start) continue;
 				state.mouseZones.push({ key: `inline:${range.id}`, action: "inline-tool", toolId: range.id, x: shell.center.x + layout.scrollback.x, y: layout.scrollback.y + start - sliceStart, width: transcriptWidth, height: end - start, footerY: layout.scrollback.y + range.end - 1 - sliceStart });
 			}
+			// Long code lines are never wrapped; a block registers a zone so the
+			// horizontal wheel / Shift+wheel can slide it sideways.
+			state.codeBlockInfo = new Map();
+			for (const block of flow.codeBlocks || []) {
+				state.codeBlockInfo.set(block.id, { maxScroll: block.maxScroll || 0, innerWidth: block.innerWidth || 0 });
+				if (block.end <= sliceStart) continue;
+				if (block.start >= visibleEnd) break;
+				const start = Math.max(block.start, sliceStart), end = Math.min(block.end, visibleEnd);
+				if (end <= start) continue;
+				state.mouseZones.push({
+					key: `code:${block.id}`,
+					action: "code-block",
+					codeId: block.id,
+					maxScroll: block.maxScroll || 0,
+					innerWidth: block.innerWidth || 0,
+					x: shell.center.x + layout.scrollback.x,
+					y: layout.scrollback.y + start - sliceStart,
+					width: transcriptWidth,
+					height: end - start,
+				});
+			}
+			for (const id of state.codeScroll.keys()) {
+				if (!state.codeBlockInfo.has(id)) state.codeScroll.delete(id);
+			}
 			if (!state.transcriptFollowTail) {
 				const topBlock = this.#blockContaining(flow.blocks, sliceStart);
 				state.transcriptAnchor = topBlock ? {
@@ -5236,6 +5574,23 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			}
 			tui.requestRender(); return true;
 		}
+		if (dialog.setupWizard && dialog.setupTab === 0 && (tui.terminal.columns || 0) >= 94 && (matchesKey(data, "left") || matchesKey(data, "right"))) {
+			dialog.setupPane = matchesKey(data, "right") ? "detail" : "list";
+			tui.requestRender(); return true;
+		}
+		if (dialog.setupWizard && dialog.setupTab === 0 && (tui.terminal.columns || 0) >= 94 && dialog.setupPane === "detail") {
+			if (matchesKey(data, "escape")) { finishDialog({ cancelled: true }); return true; }
+			const detailCount = dialog.setupDetailOptions?.length || 0;
+			if (matchesKey(data, "up")) dialog.setupDetailSelected = Math.max(0, (dialog.setupDetailSelected || 0) - 1);
+			else if (matchesKey(data, "down")) dialog.setupDetailSelected = Math.min(Math.max(0, detailCount - 1), (dialog.setupDetailSelected || 0) + 1);
+			else if (matchesKey(data, "enter") && detailCount) {
+				const provider = dialog.setupProviders?.find((item) => item.id === dialog.options?.[dialog.selected]?.split(" · ").pop());
+				const providerId = provider?.id;
+				finishDialog({ setupAction: dialog.setupDetailOptions[dialog.setupDetailSelected || 0], setupProviderId: providerId });
+				return true;
+			}
+			tui.requestRender(); return true;
+		}
 		if (dialog.setupWizard && (matchesKey(data, "tab") || matchesKey(data, "shift+tab"))) {
 			dialog.setupTab = (dialog.setupTab + (matchesKey(data, "tab") ? 1 : -1) + dialog.setupTabs.length) % dialog.setupTabs.length;
 			const tab = dialog.setupTabs[dialog.setupTab];
@@ -5275,7 +5630,9 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			dialog.query = [...dialog.query].slice(0, -1).join("");
 			dialog.options = filterSelectOptions(dialog.allOptions, dialog.descriptions, dialog.query); dialog.selected = 0; tui.requestRender(); return true;
 		}
-		if (dialog.searchable && !data.includes("\x1b") && !/[\u0000-\u001f\u007f]/.test(data)) {
+		// A space toggles in a multi-select dialog; only other printable input
+		// narrows the list, so the toggle stays reachable while searching.
+		if (dialog.searchable && !(dialog.kind === "multi" && data === " ") && !data.includes("\x1b") && !/[\u0000-\u001f\u007f]/.test(data)) {
 			dialog.query += data; dialog.options = filterSelectOptions(dialog.allOptions, dialog.descriptions, dialog.query); dialog.selected = 0; tui.requestRender(); return true;
 		}
 		if (dialog.kind === "status") {
@@ -5317,6 +5674,19 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		const dialog = state.dialog;
 		if (!dialog) return false;
 		if (dialog.setupWizard) {
+			const wideProviderLayout = dialog.setupTab === 0 && (tui.terminal.columns || 0) >= 94 && (tui.terminal.rows || 0) >= 25;
+			if (wideProviderLayout && mouse.x >= (dialog.setupPaneX || Infinity) && mouse.y >= (dialog.setupPaneY || Infinity)) {
+				const index = Math.max(0, mouse.y - (dialog.setupPaneY || 0) - 4);
+				if (index < (dialog.setupDetailOptions?.length || 0)) {
+					dialog.setupPane = "detail";
+					dialog.setupDetailSelected = index;
+					if (!mouse.motion && !mouse.wheel && mouse.release !== false) {
+						const provider = dialog.setupProviders?.find((item) => item.id === dialog.options?.[dialog.selected]?.split(" · ").pop());
+						finishDialog({ setupAction: dialog.setupDetailOptions[index], setupProviderId: provider?.id });
+					}
+					tui.requestRender(); return true;
+				}
+			}
 			const tab = dialog.setupMouseTabs?.find((entry) => mouse.y === entry.y && mouse.x >= entry.x && mouse.x < entry.x + entry.width);
 			const row = dialog.mouseRows?.find((entry) => entry.y === mouse.y);
 			const switchTab = (index) => {
@@ -5486,6 +5856,14 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			return true;
 		}
 		if (mouse.wheel && !mouse.release) {
+			// A code block swallows the horizontal wheel (and Shift+wheel) so a
+			// long line slides sideways instead of scrolling the transcript.
+			const codeZone = findMouseZone(mouse);
+			if (codeZone?.action === "code-block" && codeZone.maxScroll > 0 && (mouse.wheelHorizontal || mouse.shift)) {
+				const step = mouse.wheelHorizontal ? mouse.wheelHorizontalDirection : mouse.wheelDirection;
+				if (scrollCodeBlock(codeZone.codeId, step * 4, codeZone.maxScroll)) tui.requestRender();
+				return true;
+			}
 			const queueZone = state.mouseZones.find((zone) => zone.action === "dock-queue" &&
 				mouse.x >= zone.x && mouse.x < zone.x + zone.width && mouse.y >= zone.y && mouse.y < zone.y + zone.height);
 			if (queueZone) {
@@ -5558,6 +5936,11 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		}
 
 		state.pointer.press(zone.action, mouse.button);
+		// Any other gesture releases the keyboard focus of a scrolled code block.
+		if (zone.action !== "code-block" && state.codeFocus) {
+			state.codeFocus = undefined;
+			tui.requestRender();
+		}
 		switch (zone.action) {
 			case "transcript-scrollbar": {
 				const bar = state.transcriptScrollbar;
@@ -5611,7 +5994,7 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 			}
 			case "timeline-turn": setTranscriptOffset(zone.offset); break;
 			case "panel-body": break;
-			case "composer": tui.setFocus(editor); break;
+			case "composer": state.codeFocus = undefined; tui.setFocus(editor); break;
 			case "abort": void rpc.request({ type: "abort" }, 30_000).catch(() => {}); break;
 			case "inline-tool": {
 				const tool = state.liveTools.get(zone.toolId);
@@ -5624,6 +6007,13 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 					state.dirtyToolIds.add(zone.toolId);
 					state.workflowRevision++;
 				}
+				break;
+			}
+			case "code-block": {
+				// A click focuses the block for keyboard scrolling; a second click
+				// (or Esc) releases it.
+				state.codeFocus = state.codeFocus === zone.codeId ? undefined : zone.codeId;
+				tui.requestRender();
 				break;
 			}
 			case "mode": openModeSelector(); break;
@@ -5688,6 +6078,37 @@ export async function runTsukuyomi({ piBin, piRoot, args, env, cwd, workspaceExp
 		if (mouse && handleMouse(mouse)) return { consume: true };
 		if (editorInputFocused()) resetCursorBlink();
 		if (handleDialogKey(data)) return { consume: true };
+		// A focused code block owns the arrow keys (and Esc to release) so a long
+		// line can be scrolled from the keyboard. Any other key returns focus to
+		// the composer.
+		if (state.codeFocus && !state.dialog) {
+			// `codeBlockInfo` is rebuilt every frame; a missing entry means the
+			// block left the transcript, in which case the key falls through.
+			const info = state.codeBlockInfo?.get(state.codeFocus);
+			if (info) {
+				if (matchesKey(data, "left")) {
+					if (scrollCodeBlock(state.codeFocus, -4, info.maxScroll)) tui.requestRender();
+					return { consume: true };
+				}
+				if (matchesKey(data, "right")) {
+					if (scrollCodeBlock(state.codeFocus, 4, info.maxScroll)) tui.requestRender();
+					return { consume: true };
+				}
+				if (matchesKey(data, "home")) {
+					if (resetCodeScroll(state.codeFocus)) tui.requestRender();
+					return { consume: true };
+				}
+				if (matchesKey(data, "escape")) {
+					state.codeFocus = undefined;
+					tui.requestRender();
+					return { consume: true };
+				}
+				if (data.length === 1 && data >= " ") {
+					state.codeFocus = undefined;
+					tui.requestRender();
+				}
+			}
+		}
 		if (matchesKey(data, "enter") && !state.active && !editor.getText()) {
 			activate(); return { consume: true };
 		}

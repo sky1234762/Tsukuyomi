@@ -46,6 +46,33 @@ const bg = (rgb) => `${ESC}48;2;${rgb}m`;
 
 const BASE = fg(PAL.text);
 
+/** Tab stops used when a tab reaches the terminal. Terminals advance to the
+ *  next multiple of this width, so anything less than they assume overflows
+ *  the measured column and breaks box borders. */
+const TAB_WIDTH = 8;
+/** Tab width for source code, which conventionally indents by 4. */
+const CODE_TAB_WIDTH = 4;
+
+/** Expand tabs to spaces so no raw `\t` ever reaches the terminal. Tab stops
+ *  are counted from the start of the string. */
+export function expandTabs(value, width = CODE_TAB_WIDTH) {
+	const str = String(value ?? "");
+	if (!str.includes("\t")) return str;
+	let out = "";
+	let column = 0;
+	for (const ch of str) {
+		if (ch === "\t") {
+			const size = Math.max(1, width - (column % width));
+			out += " ".repeat(size);
+			column += size;
+			continue;
+		}
+		out += ch;
+		column += charWidth(ch.codePointAt(0));
+	}
+	return out;
+}
+
 /** Visible width of a single code point (East-Asian wide chars count as 2). */
 function charWidth(codePoint) {
 	if (codePoint >= 0x1100 && codePoint <= 0x115f) return 2;
@@ -79,7 +106,9 @@ export function visibleLength(value) {
 			continue;
 		}
 		const cp = str.codePointAt(i);
-		length += charWidth(cp);
+		// A terminal advances a tab to the next tab stop, not one column.
+		// Measuring it as one column is what let code-block borders drift.
+		length += cp === 9 ? TAB_WIDTH - (length % TAB_WIDTH) : charWidth(cp);
 		i += cp > 0xffff ? 2 : 1;
 	}
 	return length;
@@ -131,6 +160,18 @@ export function wrapAnsi(text, width, indent = "") {
 	return lines;
 }
 
+/** End index (exclusive) of the escape sequence starting at `i`. */
+function escapeEnd(text, i) {
+	if (text[i] !== "\x1b") return i + 1;
+	if (text[i + 1] === "]") {
+		const terminator = text.indexOf("\x1b\\", i + 2);
+		return terminator === -1 ? text.length : terminator + 2;
+	}
+	let end = i + 1;
+	while (end < text.length && !/[A-Za-z]/.test(text[end])) end++;
+	return end < text.length ? end + 1 : end;
+}
+
 /** Truncate an ANSI string by terminal columns without leaving an over-wide row. */
 function truncateAnsi(text, width, suffix = "…") {
 	const value = String(text ?? "");
@@ -142,28 +183,89 @@ function truncateAnsi(text, width, suffix = "…") {
 	let used = 0;
 	for (let i = 0; i < value.length;) {
 		if (value[i] === "\x1b") {
-			let end;
-			if (value[i + 1] === "]") {
-				const terminator = value.indexOf("\x1b\\", i + 2);
-				end = terminator === -1 ? value.length : terminator + 2;
-			} else {
-				end = i + 1;
-				while (end < value.length && !/[A-Za-z]/.test(value[end])) end++;
-				if (end < value.length) end++;
-			}
+			const end = escapeEnd(value, i);
 			out += value.slice(i, end);
 			i = end;
 			continue;
 		}
 		const cp = value.codePointAt(i);
 		const glyph = String.fromCodePoint(cp);
-		const glyphWidth = charWidth(cp);
+		const glyphWidth = cp === 9 ? TAB_WIDTH - (used % TAB_WIDTH) : charWidth(cp);
 		if (used + glyphWidth > target) break;
 		out += glyph;
 		used += glyphWidth;
 		i += cp > 0xffff ? 2 : 1;
 	}
 	return `${out}${suffix}${RESET}`;
+}
+
+/** Widest visible line in a (possibly multi-line, SGR-decorated) string. */
+export function measureAnsiColumns(text) {
+	let max = 0;
+	for (const line of String(text ?? "").split("\n")) {
+		const width = visibleLength(line);
+		if (width > max) max = width;
+	}
+	return max;
+}
+
+/**
+ * Slice an SGR-decorated string to the visible columns `[start, end)`.
+ *
+ * Escape sequences seen up to the right edge are copied through, even when
+ * their glyphs fall before the window, so colours opened earlier still apply to
+ * the visible part. Nothing after the window is emitted, which lets a caller
+ * split a framed row into prefix / viewport / suffix without leaking styling.
+ * A wide glyph that straddles an edge becomes spaces, keeping the column count
+ * exact for the caller's box border.
+ */
+export function sliceAnsiColumns(text, start, end) {
+	const value = String(text ?? "");
+	const from = Math.max(0, Math.floor(start) || 0);
+	const to = Math.max(from, Math.floor(end) || 0);
+	let out = "";
+	let column = 0;
+	let i = 0;
+	while (i < value.length && column < to) {
+		if (value[i] === "\x1b") {
+			const stop = escapeEnd(value, i);
+			out += value.slice(i, stop);
+			i = stop;
+			continue;
+		}
+		const cp = value.codePointAt(i);
+		const glyph = String.fromCodePoint(cp);
+		const width = cp === 9 ? TAB_WIDTH - (column % TAB_WIDTH) : charWidth(cp);
+		if (column + width <= from) {
+			column += width;
+			i += cp > 0xffff ? 2 : 1;
+			continue;
+		}
+		if (column < from || column + width > to) out += " ".repeat(Math.min(width, to - Math.max(column, from)));
+		else out += glyph;
+		column += width;
+		i += cp > 0xffff ? 2 : 1;
+	}
+	return out;
+}
+
+/**
+ * Split a framed row into the columns left of `left`, the `width`-column
+ * viewport starting at `left`, and everything to the right. Used to scroll a
+ * code block's content sideways without disturbing its box border.
+ */
+export function splitAnsiColumns(text, left, width) {
+	const value = String(text ?? "");
+	const total = visibleLength(value);
+	const leftWidth = Math.max(0, Math.min(left, total));
+	const viewWidth = Math.max(0, Math.min(width, total - leftWidth));
+	const rightWidth = Math.max(0, total - leftWidth - viewWidth);
+	return {
+		left: sliceAnsiColumns(value, 0, leftWidth),
+		view: sliceAnsiColumns(value, leftWidth, leftWidth + viewWidth),
+		right: sliceAnsiColumns(value, leftWidth + viewWidth, total),
+		rightWidth,
+	};
 }
 
 /** Split text into visible tokens (words) that carry any embedded SGR. */
@@ -522,10 +624,21 @@ function trimBareUrl(url) {
 // Block parsing
 // ─────────────────────────────────────────────────────────────────────────────
 
-export function renderMarkdown(input, { width = 80 } = {}) {
+export function renderMarkdown(input, { width = 80, depth = 0, scrolls, collect, codeSeq, codePrefix = "md", wrapCode = false } = {}) {
 	if (!input) return [];
+	// Nested list content is re-rendered recursively; a pathological input of
+	// nothing but markers would otherwise recurse without bound.
+	if (depth > 12) return wrapAnsi(`${BASE}${inlineToAnsi(String(input))}`, Math.max(1, width));
+	// Code blocks get a stable id per render so a caller can remember the
+	// horizontal scroll offset of each one across frames.
+	const seq = codeSeq ?? { n: 0 };
 	const text = String(input).replace(/\r\n?/g, "\n");
-	const lines = text.split("\n");
+	// Expand every tab once, up front. A raw tab is measured as one column here
+	// but rendered as an advance to the next terminal tab stop, so any that
+	// survived into a row would silently push a code-block border out of line.
+	// 4 columns matches the common source-code convention and keeps prose
+	// indentation readable.
+	const lines = text.split("\n").map((line) => expandTabs(line, CODE_TAB_WIDTH));
 	const rows = [];
 	let i = 0;
 
@@ -555,7 +668,13 @@ export function renderMarkdown(input, { width = 80 } = {}) {
 				i++;
 			}
 			i++; // skip closing fence
-			pushBlock(renderCodeBlock(body, lang, width));
+			const id = `${codePrefix}:${seq.n++}`;
+			const block = renderCodeBlock(body, lang, width, scrolls?.get(id) ?? 0, wrapCode);
+			pushBlock(block.rows);
+			// The rows themselves already live in the returned array; keep the
+			// metadata lean so it can be cached per message without duplication.
+			const { rows: blockRows, ...meta } = block;
+			collect?.push({ id, rowStart: rows.length - blockRows.length, rowEnd: rows.length, ...meta });
 			continue;
 		}
 
@@ -586,8 +705,16 @@ export function renderMarkdown(input, { width = 80 } = {}) {
 				quoteLines.push(lines[i].replace(/^\s*>\s?/, ""));
 				i++;
 			}
-			const inner = renderMarkdown(quoteLines.join("\n"), { width: Math.max(20, width - 2) });
-			pushBlock(inner.map((row) => `${fg(PAL.border)}│${RESET} ${row}`));
+			const innerCollect = collect ? [] : undefined;
+			const inner = renderMarkdown(quoteLines.join("\n"), { width: Math.max(20, width - 2), scrolls, collect: innerCollect, codeSeq: seq, codePrefix });
+			const blockRows = inner.map((row) => `${fg(PAL.border)}│${RESET} ${row}`);
+			pushBlock(blockRows);
+			if (innerCollect) {
+				const blockStart = rows.length - blockRows.length;
+				for (const block of innerCollect) {
+					collect.push({ ...block, rowStart: blockStart + block.rowStart, rowEnd: blockStart + block.rowEnd, indent: (block.indent || 0) + 2 });
+				}
+			}
 			continue;
 		}
 
@@ -603,22 +730,36 @@ export function renderMarkdown(input, { width = 80 } = {}) {
 		if (/^\s*([-*+]|\d+[.)])\s+/.test(line)) {
 			const list = parseList(lines, i);
 			i = list.nextIndex;
-			pushBlock(renderList(list.items, width));
+			const listCollect = collect ? [] : undefined;
+			const listRows = renderList(list.items, width, { depth, scrolls, collect: listCollect, codeSeq: seq, codePrefix });
+			pushBlock(listRows);
+			if (listCollect) {
+				const blockStart = rows.length - listRows.length;
+				for (const block of listCollect) {
+					collect.push({ ...block, rowStart: blockStart + block.rowStart, rowEnd: blockStart + block.rowEnd });
+				}
+			}
 			continue;
 		}
 
-		// Indented code block (4 spaces or a tab). Cannot interrupt a
-		// paragraph: here we are always at a block boundary because paragraph
-		// lines are consumed greedily below, so any indented run is code.
-		if (/^(?: {4}|\t)/.test(line)) {
+		// Indented code block (4 spaces; a source tab was expanded to 4 above).
+		// Cannot interrupt a paragraph: here we are always at a block boundary
+		// because paragraph lines are consumed greedily below, so any indented
+		// run is code.
+		if (/^ {4}/.test(line)) {
 			const body = [];
-			while (i < lines.length && /^(?: {4}|\t)/.test(lines[i])) {
-				body.push(lines[i].replace(/^(?: {4}|\t)/, "").replace(/\t/g, "  "));
+			// Tabs are already spaces by now, so only the 4-space form can match.
+			while (i < lines.length && /^ {4}/.test(lines[i])) {
+				body.push(lines[i].replace(/^ {4}/, ""));
 				i++;
 			}
 			// Trailing blank-adjacent runs of only whitespace are not code;
 			// the loop above already stops at blank lines.
-			pushBlock(renderCodeBlock(body, "", width));
+			const id = `${codePrefix}:${seq.n++}`;
+			const block = renderCodeBlock(body, "", width, scrolls?.get(id) ?? 0, wrapCode);
+			pushBlock(block.rows);
+			const { rows: blockRows, ...meta } = block;
+			collect?.push({ id, rowStart: rows.length - blockRows.length, rowEnd: rows.length, ...meta });
 			continue;
 		}
 
@@ -639,6 +780,20 @@ export function renderMarkdown(input, { width = 80 } = {}) {
 	return rows;
 }
 
+/**
+ * Render Markdown and also report each code block's row range and horizontal
+ * viewport, so the transcript can let the user scroll a long line sideways.
+ *
+ * @returns {{rows: string[], codeBlocks: Array<{id: string, rowStart: number,
+ *   rowEnd: number, innerWidth: number, contentWidth: number, maxScroll: number,
+ *   scrollX: number, indent: number}>}}
+ */
+export function renderMarkdownWithCode(input, options = {}) {
+	const codeBlocks = [];
+	const rows = renderMarkdown(input, { ...options, collect: codeBlocks });
+	return { rows, codeBlocks };
+}
+
 /** Detect the start of a non-paragraph block (so paragraph collection stops). */
 function startsBlock(line, next) {
 	if (!line) return false;
@@ -655,52 +810,100 @@ function startsBlock(line, next) {
 // Lists
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** `indent`, `marker`, `gap`, `body` of a list item line. */
+const LIST_MARKER = /^( *)([-*+]|\d+[.)])([ \t]+)(.*)$/;
+
+/** Leading space width of a line (tabs were expanded by renderMarkdown). */
+function indentOf(line) {
+	let n = 0;
+	while (n < line.length && line[n] === " ") n++;
+	return n;
+}
+
+/**
+ * Collect one list. Each item keeps the raw lines that belong to it, already
+ * de-indented to the item's content column, so nested blocks (paragraphs,
+ * fenced/indented code, quotes, deeper lists) survive instead of being pulled
+ * back out to column zero. The item's own marker number is preserved so an
+ * ordered list interrupted by a nested block keeps counting instead of
+ * restarting at 1.
+ */
 function parseList(lines, startIndex) {
 	const items = [];
 	let i = startIndex;
 	while (i < lines.length) {
 		const line = lines[i];
-		const m = /^( *)([-*+]|\d+[.)])[ \t]+(.*)$/.exec(line);
-		if (!m) {
-			// Indented continuation line belongs to the previous item
-			// (e.g. a wrapped description without a new marker).
-			if (
-				items.length > 0 &&
-				line.trim() !== "" &&
-				/^[ \t]+/.test(line) &&
-				!startsBlock(line.trimStart(), lines[i + 1])
-			) {
-				items[items.length - 1].text += ` ${line.trim()}`;
+		// Blank lines between items are separators, not item content.
+		if (!line.trim()) { i++; continue; }
+		const marker = LIST_MARKER.exec(line);
+		if (!marker) {
+			// A line that is not indented into the current item ends the list;
+			// the absorb loop below already claimed everything indented enough.
+			break;
+		}
+		const indent = marker[1].length;
+		const previous = items[items.length - 1];
+		// A marker at a shallower indent closes this list (an outer list owns it).
+		if (previous && indent < previous.indent) break;
+		// A different marker kind at the same indent starts a new list.
+		const ordered = /\d/.test(marker[2][0]);
+		if (previous && indent === previous.indent && ordered !== previous.ordered) break;
+		const token = marker[2];
+		const gap = marker[3].length;
+		const body = marker[4];
+		const task = /^\[([ xX])\]\s+(.*)$/.exec(body);
+		items.push({
+			indent,
+			ordered,
+			start: Number.parseInt(token, 10) || 1,
+			contentIndent: indent + token.length + gap,
+			checked: task ? task[1].toLowerCase() === "x" : undefined,
+			content: [task ? task[2] : body],
+		});
+		i++;
+		// Absorb this item's continuation lines: anything indented to the item's
+		// content column, plus blank lines that are followed by more of them.
+		const item = items[items.length - 1];
+		while (i < lines.length) {
+			const next = lines[i];
+			if (!next.trim()) {
+				let j = i;
+				while (j < lines.length && !lines[j].trim()) j++;
+				if (j >= lines.length) break;
+				const following = lines[j];
+				const followingMarker = LIST_MARKER.exec(following);
+				const continues = followingMarker
+					? followingMarker[1].length > indent
+					: indentOf(following) >= item.contentIndent;
+				if (!continues) break;
+				item.content.push("");
 				i++;
 				continue;
 			}
-			break;
+			const nextMarker = LIST_MARKER.exec(next);
+			// A sibling or outer marker ends the item; a deeper one is content.
+			if (nextMarker && nextMarker[1].length <= indent) break;
+			if (indentOf(next) < item.contentIndent) break;
+			item.content.push(next.slice(item.contentIndent));
+			i++;
 		}
-		const indent = m[1].length;
-		const markerToken = m[2];
-		const body = m[3];
-		const task = /^\s*\[( |x|X)\]\s+(.*)$/.exec(body);
-		items.push({
-			indent,
-			ordered: /\d/.test(markerToken[0]),
-			markerToken,
-			text: task ? task[2] : body,
-			checked: task ? task[1].toLowerCase() === "x" : undefined,
-		});
-		i++;
 	}
 	return { items, nextIndex: i };
 }
 
-function renderList(items, width) {
+function renderList(items, width, ctx) {
+	const { depth = 0 } = ctx;
 	const rows = [];
-	const counters = {};
+	let orderedNumber = 0;
 	for (const item of items) {
-		const depth = Math.floor(item.indent / 2);
+		const indent = "  ".repeat(depth);
 		let marker;
 		if (item.ordered) {
-			counters[depth] = (counters[depth] || 0) + 1;
-			marker = `${counters[depth]}.`;
+			// The first number comes from the source, then each item increments;
+			// a list split by a nested code block keeps counting instead of
+			// restarting at 1.
+			orderedNumber = orderedNumber === 0 ? item.start : orderedNumber + 1;
+			marker = `${orderedNumber}.`;
 		} else if (item.checked === true) {
 			marker = `${fg(PAL.success)}✔${RESET}`;
 		} else if (item.checked === false) {
@@ -708,12 +911,44 @@ function renderList(items, width) {
 		} else {
 			marker = `${fg(PAL.accent)}•${RESET}`;
 		}
-		const markerStr = `${"  ".repeat(depth)}${marker} `;
-		const content = `${BASE}${inlineToAnsi(item.text)}`;
-		const contentWidth = Math.max(10, width - visibleLength(markerStr));
-		const wrapped = wrapAnsi(content, contentWidth, "");
-		const continuation = `${"  ".repeat(depth)}  `;
-		wrapped.forEach((row, index) => {
+		const markerStr = `${indent}${marker} `;
+		const markerWidth = visibleLength(markerStr);
+		const contentWidth = Math.max(10, width - markerWidth);
+		// Render the item body as Markdown so nested blocks keep their indent.
+		const inner = item.content.join("\n");
+		let content;
+		if (item.content.length > 1) {
+			// Nested blocks are rendered with their own row offsets; shift them by
+			// where this item's rows land so a nested code block is still
+			// scrollable and hit-testable in the outer document.
+			const innerCollect = ctx.collect ? [] : undefined;
+			content = renderMarkdown(inner, {
+				width: contentWidth,
+				depth: depth + 1,
+				scrolls: ctx.scrolls,
+				collect: innerCollect,
+				codeSeq: ctx.codeSeq,
+				codePrefix: ctx.codePrefix,
+			});
+			if (innerCollect) {
+				// Row 0 carries the marker; every inner row is prefixed with the
+				// same visible width, so the offsets only need the outer offset.
+				const offset = rows.length;
+				const indentShift = markerWidth;
+				for (const block of innerCollect) {
+					ctx.collect.push({
+						...block,
+						rowStart: block.rowStart + offset,
+						rowEnd: block.rowEnd + offset,
+						indent: (block.indent || 0) + indentShift,
+					});
+				}
+			}
+		} else {
+			content = wrapAnsi(`${BASE}${inlineToAnsi(inner)}`, contentWidth, "");
+		}
+		const continuation = " ".repeat(markerWidth);
+		content.forEach((row, index) => {
 			rows.push(index === 0 ? `${markerStr}${row}` : `${continuation}${row}`);
 		});
 	}
@@ -847,13 +1082,15 @@ function renderSeparator(widths, left, mid, right) {
 // Code blocks + syntax highlighting
 // ─────────────────────────────────────────────────────────────────────────────
 
-function renderCodeBlock(lines, lang, width) {
-	const highlighted = highlight(lines.join("\n"), lang).split("\n");
-	return renderOutputBlock({
+function renderCodeBlock(lines, lang, width, scrollX = 0, wrapCode = false) {
+	// Idempotent: renderMarkdown already expanded, this guards direct callers.
+	const highlighted = highlight(lines.map((line) => expandTabs(line, CODE_TAB_WIDTH)).join("\n"), lang).split("\n");
+	return renderOutputBlockDetailed({
 		header: lang || "Code",
 		sections: [{ lines: highlighted }],
-		noWrap: true,
+		noWrap: !wrapCode,
 		width,
+		scrollX: wrapCode ? 0 : scrollX,
 	});
 }
 
@@ -899,8 +1136,14 @@ export function highlight(code, lang) {
 	return highlightClike(code, C_KEYWORDS);
 }
 
-/** OMP-style standalone frame shared by Markdown code and execution output. */
-export function renderOutputBlock({ header = "", meta = "", state, sections = [], width = 80, noWrap = false } = {}) {
+/**
+ * OMP-style standalone frame shared by Markdown code and execution output.
+ *
+ * With `noWrap` and a `scrollX` offset the frame becomes a horizontal viewport:
+ * each line is sliced to the visible columns instead of being truncated, and the
+ * full content width is reported so callers can bound the offset.
+ */
+export function renderOutputBlockDetailed({ header = "", meta = "", state, sections = [], width = 80, noWrap = false, scrollX = 0 } = {}) {
 	const columns = Math.max(5, Math.floor(width));
 	const innerWidth = Math.max(1, columns - 4);
 	const borderColor = state === "error" ? PAL.error
@@ -916,18 +1159,27 @@ export function renderOutputBlock({ header = "", meta = "", state, sections = []
 		const stable = value.replace(/\x1b\[(?:0)?m/g, (match) => `${match}${bgOpen}`).replace(/\x1b\[49m/g, `${ESC}49m${bgOpen}`);
 		return `${bgOpen}${stable}${ESC}49m`;
 	};
+	const normalized = sections.length ? sections : [{ lines: [] }];
+	const rawLines = normalized.flatMap((section) => (section.lines || []).map((line) => String(line).trimEnd()));
+	// The widest raw line bounds how far the viewport can scroll.
+	const contentWidth = rawLines.reduce((max, line) => Math.max(max, visibleLength(line)), 0);
+	const maxScroll = noWrap ? Math.max(0, contentWidth - innerWidth) : 0;
+	const offset = Math.max(0, Math.min(maxScroll, Math.floor(scrollX) || 0));
 	const fit = (value) => {
-		const clipped = truncateAnsi(value, innerWidth);
+		const windowed = offset > 0 ? sliceAnsiColumns(value, offset, offset + innerWidth) : value;
+		const clipped = offset > 0 ? windowed : truncateAnsi(windowed, innerWidth);
 		return `${clipped}${" ".repeat(Math.max(0, innerWidth - visibleLength(clipped)))}`;
 	};
-	const title = [header, meta].filter(Boolean).join(" · ");
+	// Tell the reader the block can be scrolled sideways, and where it is. Only
+	// a non-wrapping frame (code/output) has a horizontal viewport at all.
+	const scrollHint = noWrap && maxScroll > 0 ? (offset > 0 ? ` ↔ ${offset}/${maxScroll}` : " ↔") : "";
+	const title = [header, meta].filter(Boolean).join(" · ") + scrollHint;
 	const availableTitle = Math.max(0, columns - 6);
 	const titleText = availableTitle > 0 ? truncateAnsi(title, availableTitle) : "";
 	const titleSpan = titleText ? ` ${titleText} ` : "";
 	const topCap = "╭───";
 	const topFill = Math.max(0, columns - visibleLength(topCap) - visibleLength(titleSpan) - 1);
 	const rows = [paintRow(`${border}${topCap}${titleSpan}${"─".repeat(topFill)}╮${RESET}`)];
-	const normalized = sections.length ? sections : [{ lines: [] }];
 	for (let index = 0; index < normalized.length; index++) {
 		const section = normalized[index];
 		if (index > 0 || section.label) {
@@ -937,7 +1189,12 @@ export function renderOutputBlock({ header = "", meta = "", state, sections = []
 		}
 		for (const source of section.lines || []) {
 			const raw = String(source).trimEnd();
-			const wrapped = noWrap ? [raw] : wrapAnsi(raw, innerWidth);
+			const wrapped = noWrap ? [raw] : wrapAnsi(raw, innerWidth).flatMap((line) => {
+				if (visibleLength(line) <= innerWidth) return [line];
+				const chunks = [];
+				for (let start = 0; start < visibleLength(line); start += innerWidth) chunks.push(sliceAnsiColumns(line, start, start + innerWidth));
+				return chunks;
+			});
 			for (const line of wrapped.length ? wrapped : [""]) {
 				rows.push(paintRow(`${border}│${RESET} ${fit(line)} ${border}│${RESET}`));
 			}
@@ -945,11 +1202,44 @@ export function renderOutputBlock({ header = "", meta = "", state, sections = []
 	}
 	const bottomCap = "╰───";
 	rows.push(paintRow(`${border}${bottomCap}${"─".repeat(Math.max(0, columns - visibleLength(bottomCap) - 1))}╯${RESET}`));
-	return rows;
+	return { rows, contentWidth, innerWidth, maxScroll, scrollX: offset };
+}
+
+/** Rows-only wrapper kept for existing callers. */
+export function renderOutputBlock(options = {}) {
+	return renderOutputBlockDetailed(options).rows;
+}
+
+function restoreCodeIndent(highlighted, sourceLines) {
+	const lines = [...highlighted];
+	for (let index = 0; index < lines.length && lines.length > sourceLines.length; index++) {
+		if (lines[index].replace(/\x1b\[[0-9;]*m/g, "") === "" && (sourceLines[index] || "").trim() !== "") {
+			lines.splice(index, 1);
+			index--;
+		}
+	}
+	return lines.map((line, index) => {
+		const expected = (sourceLines[index] || "").match(/^ */)?.[0] || "";
+		let prefix = "";
+		let rest = String(line);
+		let removed = 0;
+		while (rest && removed < expected.length) {
+			if (rest[0] === "\x1b") {
+				const end = escapeEnd(rest, 0);
+				prefix += rest.slice(0, end);
+				rest = rest.slice(end);
+				continue;
+			}
+			if (rest[0] !== " ") break;
+			removed++;
+			rest = rest.slice(1);
+		}
+		return `${prefix}${expected}${rest}`;
+	});
 }
 
 /** Render a growing fenced block without restarting Syntect for every token. */
-export function renderStreamingCodeBlock(text, { width = 80, streamState = {} } = {}) {
+export function renderStreamingCodeBlock(text, { width = 80, streamState = {}, scrollX = 0, id, collect } = {}) {
 	const opening = /^\s*(`{3,}|~{3,})([^\r\n]*)\r?\n/.exec(String(text || ""));
 	if (!opening) return undefined;
 	const marker = opening[1][0];
@@ -961,7 +1251,11 @@ export function renderStreamingCodeBlock(text, { width = 80, streamState = {} } 
 	// Once prose follows the closing fence this helper would otherwise hide it;
 	// let the complete Markdown renderer own mixed blocks in that case.
 	if (closeIndex !== -1 && bodyLines.slice(closeIndex + 1).some((line) => line.trim())) return undefined;
-	const codeLines = closeIndex === -1 ? bodyLines : bodyLines.slice(0, closeIndex);
+	// Expand tabs on the way in. `codeToFeed` is recomputed from the full text on
+	// every call, so the expansion is stable and the incremental feed length
+	// bookkeeping still holds; the highlighter just sees spaces instead of tabs.
+	const codeLines = (closeIndex === -1 ? bodyLines : bodyLines.slice(0, closeIndex))
+		.map((line) => expandTabs(line, CODE_TAB_WIDTH));
 	const code = codeLines.join("\n");
 	const closed = closeIndex !== -1;
 	const codeToFeed = closed ? (code ? `${code}\n` : "") : code;
@@ -987,13 +1281,25 @@ export function renderStreamingCodeBlock(text, { width = 80, streamState = {} } 
 	} else {
 		highlighted = highlight(code, language);
 	}
+	// Incremental native highlighters may normalize whitespace at chunk
+	// boundaries. Restore source indentation after highlighting so a streamed
+	// code block cannot visibly lose a column when a new token arrives.
+	highlighted = restoreCodeIndent(highlighted.split("\n"), codeLines).join("\n");
 
-	return renderOutputBlock({
+	const detailed = renderOutputBlockDetailed({
 		header: language || "Code",
 		sections: [{ lines: highlighted.split("\n").filter((line, index, rows) => index < rows.length - 1 || line) }],
 		noWrap: true,
 		width,
+		scrollX,
 	});
+	// Streaming callers still receive a plain row array; a caller that needs the
+	// horizontal viewport (and its bounds) can pass `collect`.
+	if (collect && id) {
+		const { rows: blockRows, ...meta } = detailed;
+		collect.push({ id, rowStart: 0, rowEnd: blockRows.length, ...meta });
+	}
+	return detailed.rows;
 }
 
 function highlightClike(code, keywords) {

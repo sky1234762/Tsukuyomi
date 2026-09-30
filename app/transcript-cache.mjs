@@ -24,6 +24,7 @@ export function createHistoryCache() {
 		blockIndex: new Map(),
 		toolIds: new Set(),
 		toolRanges: [],
+		codeBlocks: [],
 		toolMessageIndex: new Map(),
 		toolResults: new Map(),
 		total: 0,
@@ -109,10 +110,11 @@ export function messageSignature(message, {
 	thinkingExpanded,
 	lastWorkMs,
 	lastThoughtMs,
+	codeScrollKey = "",
 	now = 0,
 } = {}) {
 	const identity = messageIdentity(message);
-	if (!message || message.role !== "assistant") return identity;
+	if (!message || message.role !== "assistant") return `${identity}|${codeScrollKey}`;
 	const tools = [];
 	let thinking = "-";
 	for (const part of Array.isArray(message.content) ? message.content : []) {
@@ -124,7 +126,7 @@ export function messageSignature(message, {
 		}
 	}
 	const last = index === lastAssistantIndex ? `w${lastWorkMs ?? ""}:t${lastThoughtMs ?? ""}` : "";
-	return `${identity}|${tools.join(",")}|${thinking}|${last}`;
+	return `${identity}|${tools.join(",")}|${thinking}|${last}|${codeScrollKey}`;
 }
 
 function renderIndex(cache, index, message, ctx) {
@@ -141,9 +143,10 @@ function renderIndex(cache, index, message, ctx) {
 		thinkingExpanded: ctx.thinkingExpanded,
 		lastWorkMs: ctx.lastWorkMs,
 		lastThoughtMs: ctx.lastThoughtMs,
+		codeScrollKey: ctx.codeScrollKey?.(index) ?? "",
 		now: ctx.now,
 	});
-	cache.entries.set(index, { signature, message, lines: rendered.lines, block: rendered.block, localToolRanges: rendered.localToolRanges || [] });
+	cache.entries.set(index, { signature, message, lines: rendered.lines, block: rendered.block, localToolRanges: rendered.localToolRanges || [], localCodeBlocks: rendered.localCodeBlocks || [] });
 	cache.rendered += 1;
 }
 
@@ -153,6 +156,7 @@ export function assembleHistory(cache, messages) {
 	const blocks = [];
 	const userBlocks = [];
 	const toolRanges = [];
+	const codeBlocks = [];
 	const toolIds = new Set();
 	const blockIndex = new Map();
 	const list = Array.isArray(messages) ? messages : [];
@@ -174,6 +178,9 @@ export function assembleHistory(cache, messages) {
 			toolRanges.push({ id: range.id, start: start + range.start, end: start + range.end });
 			toolIds.add(range.id);
 		}
+		for (const block of entry.localCodeBlocks || []) {
+			codeBlocks.push({ ...block, start: start + block.start, end: start + block.end });
+		}
 		segments.push({ start, end: total, lines: entry.lines });
 	}
 	let assistantSeen = false;
@@ -189,6 +196,7 @@ export function assembleHistory(cache, messages) {
 	cache.blockIndex = blockIndex;
 	cache.toolIds = toolIds;
 	cache.toolRanges = toolRanges;
+	cache.codeBlocks = codeBlocks;
 	cache.assembles += 1;
 	cache.didAssemble = true;
 }
@@ -239,6 +247,12 @@ export function syncHistoryCache(cache, ctx) {
 	}
 	const lastMetaChanged = cache.lastWorkMs !== ctx.lastWorkMs || cache.lastThoughtMs !== ctx.lastThoughtMs;
 	if (lastMetaChanged && lastAssistantIndex >= 0) touched.add(lastAssistantIndex);
+	// Scrolling a code block changes only its owning message's render, so the
+	// caller hands us just those indices instead of busting the whole cache.
+	if (ctx.dirtyCodeIndices?.size) {
+		for (const index of ctx.dirtyCodeIndices) touched.add(index);
+		ctx.dirtyCodeIndices.clear();
+	}
 	cache.lastWorkMs = ctx.lastWorkMs;
 	cache.lastThoughtMs = ctx.lastThoughtMs;
 	if (ctx.liveTools?.size && cache.toolMessageIndex.size) {
@@ -292,6 +306,7 @@ export function syncHistoryCache(cache, ctx) {
 			thinkingExpanded: ctx.thinkingExpanded,
 			lastWorkMs: ctx.lastWorkMs,
 			lastThoughtMs: ctx.lastThoughtMs,
+			codeScrollKey: ctx.codeScrollKey?.(index) ?? "",
 			now: ctx.now,
 		});
 		const existing = cache.entries.get(index);

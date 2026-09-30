@@ -51,5 +51,19 @@ test("ask panel shows tabs, recommendation, and separate descriptions", () => {
 	assert.equal(panel.tabs[1].active, true);
 	assert.equal(panel.options[0].recommended, true);
 	assert.equal(panel.options[0].description, "Less code");
+	assert.equal(panel.left, 0);
+	assert.equal(panel.boxWidth, 90);
 	assert.ok(panel.boxHeight < 30);
+});
+
+test("ask panel stays compact and left-aligned on a tall terminal", () => {
+	const panel = askPanelModel({
+		width: 120,
+		height: 50,
+		questions: [{ header: "Scope", question: "Choose the scope." }],
+		options: [{ label: "Small" }, { label: "Large" }],
+	});
+	assert.equal(panel.left, 0);
+	assert.equal(panel.boxWidth, 120);
+	assert.ok(panel.boxHeight <= 12);
 });
