@@ -2,12 +2,15 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
 	renderMarkdown,
+	renderMarkdownWithCode,
 	renderOutputBlock,
 	renderStreamingCodeBlock,
 	highlight,
 	inlineAnsi,
 	langFromPath,
 	visibleLength,
+	sliceAnsiColumns,
+	splitAnsiColumns,
 } from "../app/markdown.mjs";
 import { TSUKUYOMI_PALETTE } from "../app/design-system.mjs";
 
@@ -189,6 +192,25 @@ test("streaming code blocks preserve native highlighting state", () => {
 	assert.ok(second.every((row) => visibleLength(row) <= 40));
 });
 
+test("streaming code blocks preserve leading indentation across token updates", () => {
+	const streamState = {};
+	const source = [
+		"```js",
+		"function run() {",
+		"    if (ready) {",
+		"        return value;",
+		"    }",
+		"}",
+	].join("\n");
+	const first = renderStreamingCodeBlock(source.slice(0, source.indexOf("        return")) + "\n", { width: 50, streamState });
+	const second = renderStreamingCodeBlock(source, { width: 50, streamState });
+	assert.ok(first && second);
+	const rows = second.map(stripAnsi);
+	assert.ok(rows.some((row) => /^│ {5}if \(ready\)/.test(row)), "four-space indentation is preserved");
+	assert.ok(rows.some((row) => /^│ {9}return value/.test(row)), "eight-space indentation is preserved");
+	assert.ok(rows.some((row) => /^│ {5}}/.test(row)), "closing indentation is preserved");
+});
+
 test("mixed content after a closed streaming fence uses full Markdown rendering", () => {
 	const rows = renderStreamingCodeBlock("```js\nconst answer = 42\n```\nAfter", { width: 40, streamState: {} });
 	assert.equal(rows, undefined);
@@ -200,6 +222,124 @@ test("code blocks do not wrap long lines", () => {
 	const rows = renderMarkdown(md, { width: 40 });
 	const codeRow = rows.find((row) => stripAnsi(row).includes("x"));
 	assert.ok(codeRow && visibleLength(codeRow) <= 40, "code line stays within the output frame");
+});
+
+test("renderMarkdownWithCode reports a code block's rows and horizontal bounds", () => {
+	const long = "const value = aVeryLongFunctionName(argumentOne, argumentTwo);";
+	const { rows, codeBlocks } = renderMarkdownWithCode(`before\n\n\`\`\`js\n${long}\nshort\n\`\`\`\n\nafter`, { width: 40 });
+	assert.equal(codeBlocks.length, 1);
+	const block = codeBlocks[0];
+	assert.equal(block.id, "md:0");
+	assert.ok(block.contentWidth > block.innerWidth, "the longest line exceeds the viewport");
+	assert.equal(block.maxScroll, block.contentWidth - block.innerWidth);
+	assert.ok(stripAnsi(rows[block.rowStart]).startsWith("╭"), "rowStart is the top border");
+	assert.ok(stripAnsi(rows[block.rowEnd - 1]).startsWith("╰"), "rowEnd is one past the bottom border");
+	assert.ok(stripAnsi(rows[block.rowStart + 1]).includes("…"), "unscrolled rows truncate as before");
+});
+
+test("a code block scrolls sideways without moving its border", () => {
+	const long = "const value = aVeryLongFunctionName(argumentOne, argumentTwo);";
+	const md = `\`\`\`js\n${long}\n\`\`\``;
+	const base = renderMarkdownWithCode(md, { width: 40 });
+	const id = base.codeBlocks[0].id;
+	const scrolled = renderMarkdownWithCode(md, { width: 40, scrolls: new Map([[id, 20]]) });
+	const baseRow = stripAnsi(base.rows[1]);
+	const scrolledRow = stripAnsi(scrolled.rows[1]);
+	assert.equal(visibleLength(scrolledRow), 40, "the frame keeps its width");
+	assert.ok(scrolledRow.startsWith("│ ") && scrolledRow.endsWith(" │"), "borders are untouched");
+	assert.notEqual(scrolledRow, baseRow, "the content window moved");
+	assert.ok(scrolledRow.includes("aVeryLongFunctionName".slice(20)), "the visible slice starts at the offset");
+	// The reported offset is clamped to the content, so over-scrolling is safe.
+	const clamped = renderMarkdownWithCode(md, { width: 40, scrolls: new Map([[id, 9999]]) });
+	assert.equal(clamped.codeBlocks[0].scrollX, clamped.codeBlocks[0].maxScroll);
+});
+
+test("a scrollable code block advertises the horizontal viewport", () => {
+	const long = "const value = aVeryLongFunctionName(argumentOne, argumentTwo);";
+	const md = `\`\`\`js\n${long}\n\`\`\``;
+	const base = renderMarkdownWithCode(md, { width: 40 });
+	assert.ok(stripAnsi(base.rows[0]).includes("↔"), "the header hints that the block scrolls");
+	assert.ok(!stripAnsi(base.rows[0]).includes("/"), "no offset is shown at position 0");
+	const id = base.codeBlocks[0].id;
+	const scrolled = renderMarkdownWithCode(md, { width: 40, scrolls: new Map([[id, 20]]) });
+	assert.ok(stripAnsi(scrolled.rows[0]).includes(`20/${base.codeBlocks[0].maxScroll}`), "the header shows the offset");
+	// A block that already fits never grows a hint.
+	const short = renderMarkdownWithCode("```\nab\n```", { width: 40 });
+	assert.ok(!stripAnsi(short.rows[0]).includes("↔"));
+});
+
+test("code blocks nested in a list and a quote keep their own scroll viewport", () => {
+	const long = "const value = aVeryLongFunctionName(argumentOne, argumentTwo);";
+	const list = renderMarkdownWithCode(`- step\n\n  \`\`\`js\n  ${long}\n  \`\`\`\n\n- next`, { width: 44 });
+	assert.equal(list.codeBlocks.length, 1);
+	assert.equal(list.codeBlocks[0].indent, 2, "the list prefix is part of the frame's column offset");
+	const quote = renderMarkdownWithCode(`> \`\`\`js\n> ${long}\n> \`\`\``, { width: 44 });
+	assert.equal(quote.codeBlocks.length, 1);
+	assert.ok(stripAnsi(quote.rows[quote.codeBlocks[0].rowStart]).startsWith("│ ╭"), "the quote border precedes the frame");
+});
+
+test("sliceAnsiColumns keeps SGR state and exact column counts", () => {
+	const red = `${ESC}31m`;
+	const text = `${red}abcdefghij${RESET}`;
+	assert.equal(stripAnsi(sliceAnsiColumns(text, 2, 5)), "cde");
+	assert.ok(sliceAnsiColumns(text, 2, 5).startsWith(red), "colour opened before the window survives");
+	assert.equal(sliceAnsiColumns("ab", 0, 5), "ab", "does not pad past the content");
+	assert.equal(sliceAnsiColumns("abcdef", 2, 2), "");
+});
+
+test("splitAnsiColumns divides a framed row without leaking styling", () => {
+	const row = `${ESC}90m│${RESET} ${ESC}31mred text here${RESET} ${ESC}90m│${RESET}`;
+	const parts = splitAnsiColumns(row, 2, 4);
+	assert.equal(stripAnsi(parts.left), "│ ");
+	assert.equal(stripAnsi(parts.view), "red ");
+	assert.equal(stripAnsi(parts.right), "text here │");
+	assert.ok(!parts.left.includes("\x1b[31m"), "the prefix does not inherit the viewport colour");
+});
+
+test("tabs are expanded so code-block borders stay aligned", () => {
+	const md = "```js\nfunction f() {\n\tif (x) {\n\t\treturn 1;\n\t}\n}\n```";
+	const rows = renderMarkdown(md, { width: 40 });
+	const text = rows.map(stripAnsi);
+	assert.ok(!text.some((row) => row.includes("\t")), "no raw tab reaches the terminal");
+	assert.ok(text.some((row) => row.includes("    if (x) {")), "one tab becomes four spaces");
+	assert.ok(text.some((row) => row.includes("        return 1;")), "two tabs become eight spaces");
+	// Every framed row must be exactly the requested width, or the right border
+	// drifts out of line (the original bug).
+	for (const row of text.filter((line) => line.startsWith("│") || line.startsWith("╭") || line.startsWith("╰"))) {
+		assert.equal(visibleLength(row), 40, `aligned row: ${JSON.stringify(row)}`);
+	}
+});
+
+test("a tab inside an indented code block measures to the next tab stop", () => {
+	const rows = renderMarkdown("    a\n\tb", { width: 30 });
+	const text = rows.map(stripAnsi);
+	assert.ok(!text.some((row) => row.includes("\t")));
+	assert.ok(text.some((row) => row.includes("b")), "content after the tab is still visible");
+});
+
+test("ordered lists keep counting across an interrupting code block", () => {
+	const md = "1. first\n\n   ```\n   code\n   ```\n\n2. second\n3. third";
+	const text = stripAnsi(renderMarkdown(md, { width: 40 }).join("\n"));
+	assert.ok(text.includes("1. first"), "first item keeps its source number");
+	assert.ok(text.includes("2. second"), "second item continues");
+	assert.ok(text.includes("3. third"), "third item continues");
+	assert.ok(!/\b1\. second\b/.test(text), "numbering does not reset to 1");
+});
+
+test("ordered lists honour an explicit start number", () => {
+	const text = stripAnsi(renderMarkdown("3. three\n4. four", { width: 40 }).join("\n"));
+	assert.ok(text.includes("3. three"));
+	assert.ok(text.includes("4. four"));
+});
+
+test("a fenced code block nested in a list keeps the list indent", () => {
+	const md = "- step one\n\n  ```bash\n  npm install\n  ```\n\n- step two";
+	const rows = renderMarkdown(md, { width: 40 }).map(stripAnsi);
+	const border = rows.find((row) => row.includes("╭"));
+	assert.ok(border, "code block is rendered");
+	assert.ok(border.startsWith("  ╭"), `border is indented under the item: ${JSON.stringify(border)}`);
+	assert.ok(rows.some((row) => row.includes("npm install")));
+	assert.ok(rows.some((row) => row.includes("step two")), "the list continues after the block");
 });
 
 test("highlight decorates JavaScript keywords and strings", () => {

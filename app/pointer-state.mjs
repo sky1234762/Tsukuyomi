@@ -58,6 +58,9 @@ export function parseSgrMouse(data) {
 	const baseButton = button & 3;
 	const wheel = (button & 64) !== 0;
 	const release = match[4] === "m" && !wheel;
+	// Wheel reports reuse the low two bits: 0/1 are vertical, 2/3 horizontal.
+	const wheelLeft = wheel && baseButton === 2;
+	const wheelRight = wheel && baseButton === 3;
 	return {
 		button,
 		x: Number(match[2]) - 1,
@@ -67,7 +70,13 @@ export function parseSgrMouse(data) {
 		middle: !wheel && baseButton === 1,
 		right: !wheel && baseButton === 2,
 		wheel,
-		wheelDirection: wheel ? (baseButton === 0 ? -1 : 1) : 0,
+		wheelDirection: wheel && !wheelLeft && !wheelRight ? (baseButton === 0 ? -1 : 1) : 0,
+		wheelHorizontal: wheelLeft || wheelRight,
+		wheelHorizontalDirection: wheelLeft ? -1 : wheelRight ? 1 : 0,
+		// Shift/Ctrl/Alt arrive as extra bits on the same button number.
+		shift: (button & 4) !== 0,
+		alt: (button & 8) !== 0,
+		ctrl: (button & 16) !== 0,
 		motion: (button & 32) !== 0,
 	};
 }

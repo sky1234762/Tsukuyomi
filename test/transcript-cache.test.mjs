@@ -15,6 +15,7 @@ function makeContext(messages, overrides = {}) {
 		lastThoughtMs: undefined,
 		now: 1000,
 		dirtyToolIds: new Set(),
+		dirtyCodeIndices: new Set(),
 		renderMessage: (index, message) => {
 			renders += 1;
 			return {
@@ -70,4 +71,43 @@ test("syncHistoryCache re-renders only the message owning a dirty tool", () => {
 	ctx.liveTools.set("t1", { status: "running", startedAt: 0, revision: 1 });
 	syncHistoryCache(cache, ctx);
 	assert.equal(count() - baseline, 1, "only the tool owner re-renders");
+});
+
+test("assembleHistory offsets a message's code blocks to document rows", () => {
+	const messages = [{ role: "user", id: "u1" }, { role: "assistant", id: "a1" }];
+	const cache = createHistoryCache();
+	const { ctx } = makeContext(messages, {
+		renderMessage: (index, message) => ({
+			lines: [`row-${index}-${message.role}`],
+			block: { kind: message.role, messageIndex: index, start: 0, end: 0 },
+			localToolRanges: [],
+			// The block starts two rows into the message's own rows.
+			localCodeBlocks: index === 1 ? [{ id: "m1:text:0", start: 0, end: 1, innerWidth: 36, maxScroll: 12 }] : [],
+		}),
+	});
+	syncHistoryCache(cache, ctx);
+	assert.deepEqual(cache.codeBlocks, [{ id: "m1:text:0", start: 1, end: 2, innerWidth: 36, maxScroll: 12 }]);
+});
+
+test("a changed code scroll offset re-renders only its owning message", () => {
+	const messages = [
+		{ role: "user", id: "u1" },
+		{ role: "assistant", id: "a1" },
+		{ role: "user", id: "u2" },
+		{ role: "assistant", id: "a2" },
+	];
+	const cache = createHistoryCache();
+	let scrollKey = "";
+	const { ctx, count } = makeContext(messages, { codeScrollKey: (index) => (index === 1 ? scrollKey : "") });
+	syncHistoryCache(cache, ctx);
+	const baseline = count();
+	// The fast path reuses everything while the offset is unchanged.
+	syncHistoryCache(cache, ctx);
+	assert.equal(count(), baseline, "no render when the offset is unchanged");
+
+	scrollKey = "m1:text:0=8;";
+	ctx.dirtyCodeIndices.add(1);
+	syncHistoryCache(cache, ctx);
+	assert.equal(count() - baseline, 1, "only the scrolled message re-renders");
+	assert.equal(cache.codeBlocks.length, 0);
 });
